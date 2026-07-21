@@ -7,19 +7,6 @@
   "observability": {
     "enabled": true
   },
-  "d1_databases": [
-    {
-      "binding": "MAIL_DB",
-      "database_name": "cf-mail-compat-db",
-      "database_id": "replace-with-your-d1-database-id"
-    }
-  ],
-  "r2_buckets": [
-    {
-      "binding": "MAIL_RAW",
-      "bucket_name": "cf-mail-compat-raw"
-    }
-  ],
   "triggers": {
     "crons": [
       "*/30 * * * *"

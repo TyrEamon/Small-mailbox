@@ -18,15 +18,22 @@ export default {
     }
 
     try {
-      ensureBindings(env);
-      await ensureSchema(env);
-
       const url = new URL(request.url);
       const path = trimTrailingSlash(url.pathname);
 
       if (request.method === "GET" && path === "/health") {
-        return json({ ok: true });
+        return json({
+          ok: true,
+          bindings: {
+            MAIL_DB: Boolean(env.MAIL_DB),
+            MAIL_RAW: Boolean(env.MAIL_RAW),
+            MAIL_KV: Boolean(env.MAIL_KV),
+          },
+        });
       }
+
+      ensureBindings(env);
+      await ensureSchema(env);
 
       if (request.method === "POST" && path === "/admin/new_address") {
         return handleNewAddress(request, env);
@@ -80,15 +87,7 @@ export default {
     const sender = normalizeEmail(message.from || getRawHeader(rawText, "from") || "");
     const name = getEmailName(recipient);
 
-    await env.MAIL_RAW.put(rawKey, rawBuffer, {
-      httpMetadata: {
-        contentType: "message/rfc822",
-      },
-      customMetadata: {
-        recipient,
-        sender,
-      },
-    });
+    await putRawMail(env, rawKey, rawBuffer, rawText, { recipient, sender });
 
     await env.MAIL_DB.prepare(
       `INSERT INTO addresses (address, name, domain)
@@ -188,15 +187,15 @@ async function handleMailDetail(request, env, id) {
     return errorJson("mail_not_found", 404);
   }
 
-  const rawObject = await env.MAIL_RAW.get(mail.raw_key);
-  if (!rawObject) {
+  const raw = await getRawMail(env, mail.raw_key);
+  if (!raw) {
     return errorJson("mail_raw_not_found", 404);
   }
 
   return json({
     id: mail.id,
     _id: mail.id,
-    raw: await rawObject.text(),
+    raw,
   });
 }
 
@@ -218,9 +217,41 @@ async function cleanupExpiredMail(env) {
 
   const rows = expired.results || [];
   for (const row of rows) {
-    await env.MAIL_RAW.delete(row.raw_key);
+    await deleteRawMail(env, row.raw_key);
     await env.MAIL_DB.prepare("DELETE FROM mails WHERE id = ?").bind(row.id).run();
   }
+}
+
+async function putRawMail(env, rawKey, rawBuffer, rawText, metadata) {
+  if (env.MAIL_RAW) {
+    await env.MAIL_RAW.put(rawKey, rawBuffer, {
+      httpMetadata: {
+        contentType: "message/rfc822",
+      },
+      customMetadata: metadata,
+    });
+    return;
+  }
+
+  await env.MAIL_KV.put(rawKey, rawText);
+}
+
+async function getRawMail(env, rawKey) {
+  if (env.MAIL_RAW) {
+    const rawObject = await env.MAIL_RAW.get(rawKey);
+    return rawObject ? rawObject.text() : null;
+  }
+
+  return env.MAIL_KV.get(rawKey);
+}
+
+async function deleteRawMail(env, rawKey) {
+  if (env.MAIL_RAW) {
+    await env.MAIL_RAW.delete(rawKey);
+    return;
+  }
+
+  await env.MAIL_KV.delete(rawKey);
 }
 
 async function ensureSchema(env) {
@@ -522,8 +553,8 @@ function ensureBindings(env) {
   if (!env.MAIL_DB) {
     throw httpError("missing_mail_db_binding", 500);
   }
-  if (!env.MAIL_RAW) {
-    throw httpError("missing_mail_raw_binding", 500);
+  if (!env.MAIL_RAW && !env.MAIL_KV) {
+    throw httpError("missing_mail_storage_binding", 500);
   }
 }
 

@@ -15,10 +15,10 @@
 - Cloudflare Email Routing 使用 catch-all：`*@EMAIL_DOMAIN -> Worker`
 - Worker 的 `email()` handler 接收任意前缀邮箱
 - D1 保存邮件索引
-- R2 保存完整 raw MIME
+- R2 保存完整 raw MIME；如果你手动绑定 `MAIL_KV` 而不是 `MAIL_RAW`，也能作为小邮件 fallback 使用
 - JWT 绑定单个邮箱地址，不能跨邮箱读取
 
-raw 邮件不用 KV：邮件原文可能很大，KV 有单 value 限制；R2 更适合对象数据。
+推荐 raw 邮件用 R2：邮件原文可能很大，KV 有单 value 限制；R2 更适合对象数据。
 
 ## 推荐部署：GitHub 连接 Cloudflare，资源手动创建
 
@@ -26,9 +26,9 @@ raw 邮件不用 KV：邮件原文可能很大，KV 有单 value 限制；R2 更
 
 - 代码从 GitHub 自动部署
 - D1 你手动创建
-- R2 你手动创建
+- R2 或 KV 你手动创建
 - 变量和 secrets 你在 Cloudflare 后台手动填
-- D1 ID / R2 bucket name 写进 `wrangler.jsonc`
+- 绑定在 Cloudflare 后台手动加，不需要先写进 `wrangler.jsonc`
 - Worker 第一次请求或第一次收信时会自动初始化 D1 表
 
 步骤见 `GitHub自动部署步骤.md`。
