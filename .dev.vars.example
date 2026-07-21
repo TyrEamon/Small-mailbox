@@ -1,0 +1,2 @@
+EMAIL_AUTH=replace-with-a-long-admin-secret
+JWT_SECRET=replace-with-a-different-long-jwt-secret

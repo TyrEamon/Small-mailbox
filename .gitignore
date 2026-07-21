@@ -1,0 +1,8 @@
+node_modules/
+.wrangler/
+.dev.vars
+.env
+*.log
+方案.md
+GitHub自动部署步骤.md
+网页手动部署步骤.md
