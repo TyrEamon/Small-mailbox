@@ -76,6 +76,18 @@ export default {
         return handleRedeem(request, env);
       }
 
+      if (request.method === "GET" && path === "/app/api/api_keys") {
+        return handleApiKeyList(request, env);
+      }
+
+      if (request.method === "POST" && path === "/app/api/api_keys") {
+        return handleCreateApiKey(request, env);
+      }
+
+      if (request.method === "POST" && path === "/app/api/api_keys/revoke") {
+        return handleRevokeApiKey(request, env);
+      }
+
       if (request.method === "GET" && path === "/app/api/addresses") {
         return handleAppAddressList(request, env);
       }
@@ -174,11 +186,19 @@ export default {
 };
 
 async function handleNewAddress(request, env) {
-  await requireAdmin(request, env);
+  const actor = await requireAddressCreator(request, env);
 
   const body = await readJsonBody(request);
   const name = normalizeAddressName(body.name || createAddressName());
   const domain = normalizeDomain(body.domain || getDefaultDomain(env));
+
+  if (actor.type === "user") {
+    const created = await createOwnedAddressWithDebit(env, actor.user.id, name, domain);
+    return json({
+      address: created.address,
+      jwt: created.jwt,
+    }, created.created ? 201 : 200);
+  }
 
   if (!isAllowedDomain(env, domain)) {
     return errorJson("domain_not_allowed", 400);
@@ -326,6 +346,67 @@ async function handleRedeem(request, env) {
     user: publicUser(updatedUser),
     credits_added: Number(redeemCode.credits),
   });
+}
+
+async function handleApiKeyList(request, env) {
+  const user = await requireUserSession(request, env);
+  const result = await env.MAIL_DB.prepare(
+    `SELECT id, name, key_prefix, created_at, last_used_at, revoked_at
+     FROM user_api_keys
+     WHERE user_id = ?
+     ORDER BY created_at DESC`
+  ).bind(user.id).all();
+  const rows = (result.results || []).map(apiKeyRow);
+
+  return json({ results: rows, data: rows });
+}
+
+async function handleCreateApiKey(request, env) {
+  const user = await requireUserSession(request, env);
+  const body = await readJsonBody(request);
+  const name = normalizeApiKeyName(body.name || "default");
+  const apiKey = createApiKey();
+  const keyHash = await sha256Base64url(apiKey);
+  const keyPrefix = apiKey.slice(0, 12);
+
+  await env.MAIL_DB.prepare(
+    `INSERT INTO user_api_keys (user_id, name, key_prefix, key_hash)
+     VALUES (?, ?, ?, ?)`
+  ).bind(user.id, name, keyPrefix, keyHash).run();
+
+  const row = await env.MAIL_DB.prepare(
+    `SELECT id, name, key_prefix, created_at, last_used_at, revoked_at
+     FROM user_api_keys
+     WHERE key_hash = ?
+     LIMIT 1`
+  ).bind(keyHash).first();
+
+  return json({
+    api_key: apiKey,
+    key: apiKeyRow(row),
+    env: {
+      EMAIL_API: "https://你的-worker-域名",
+      EMAIL_AUTH: apiKey,
+      EMAIL_DOMAIN: getDefaultDomain(env),
+    },
+  }, 201);
+}
+
+async function handleRevokeApiKey(request, env) {
+  const user = await requireUserSession(request, env);
+  const body = await readJsonBody(request);
+  const id = parsePositiveInt(body.id, "invalid_api_key_id", 1, 2147483647);
+  const result = await env.MAIL_DB.prepare(
+    `UPDATE user_api_keys
+     SET revoked_at = CURRENT_TIMESTAMP
+     WHERE id = ? AND user_id = ? AND revoked_at IS NULL`
+  ).bind(id, user.id).run();
+
+  if (!hasChanges(result)) {
+    return errorJson("api_key_not_found", 404);
+  }
+
+  return json({ ok: true });
 }
 
 async function handleAppAddressList(request, env) {
@@ -806,6 +887,19 @@ async function initializeSchema(env) {
   ).run();
 
   await env.MAIL_DB.prepare(
+    `CREATE TABLE IF NOT EXISTS user_api_keys (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      name TEXT NOT NULL DEFAULT 'default',
+      key_prefix TEXT NOT NULL,
+      key_hash TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      last_used_at TEXT,
+      revoked_at TEXT
+    )`
+  ).run();
+
+  await env.MAIL_DB.prepare(
     `CREATE INDEX IF NOT EXISTS idx_addresses_user
      ON addresses(user_id, created_at DESC)`
   ).run();
@@ -823,6 +917,11 @@ async function initializeSchema(env) {
   await env.MAIL_DB.prepare(
     `CREATE INDEX IF NOT EXISTS idx_redeem_uses_code
      ON redeem_uses(code, created_at DESC)`
+  ).run();
+
+  await env.MAIL_DB.prepare(
+    `CREATE INDEX IF NOT EXISTS idx_user_api_keys_user
+     ON user_api_keys(user_id, created_at DESC)`
   ).run();
 }
 
@@ -851,6 +950,21 @@ async function requireAdmin(request, env) {
   }
 }
 
+async function requireAddressCreator(request, env) {
+  const headerAuth = request.headers.get("x-admin-auth") || "";
+
+  if (env.EMAIL_AUTH && safeEqual(headerAuth, env.EMAIL_AUTH)) {
+    return { type: "admin" };
+  }
+
+  const user = await getUserByApiKey(env, headerAuth);
+  if (user) {
+    return { type: "user", user };
+  }
+
+  throw httpError("unauthorized", 401);
+}
+
 async function requireAddressJwt(request, env) {
   const payload = await requireBearerPayload(request, env);
   const address = normalizeEmail(payload.address || "");
@@ -864,6 +978,19 @@ async function requireAddressJwt(request, env) {
 }
 
 async function requireUser(request, env) {
+  const token = getBearerToken(request);
+
+  if (isValidApiKey(token)) {
+    const user = await getUserByApiKey(env, token);
+    if (user) {
+      return user;
+    }
+  }
+
+  return requireUserSession(request, env);
+}
+
+async function requireUserSession(request, env) {
   const payload = await requireBearerPayload(request, env);
 
   if (payload.type !== "user" || !payload.userId) {
@@ -879,6 +1006,10 @@ async function requireUser(request, env) {
 }
 
 async function requireBearerPayload(request, env) {
+  return verifyJwt(env, getBearerToken(request));
+}
+
+function getBearerToken(request) {
   const authorization = request.headers.get("authorization") || "";
   const match = authorization.match(/^Bearer\s+(.+)$/i);
 
@@ -886,7 +1017,7 @@ async function requireBearerPayload(request, env) {
     throw httpError("unauthorized", 401);
   }
 
-  return verifyJwt(env, match[1]);
+  return match[1].trim();
 }
 
 async function signUserToken(env, user) {
@@ -916,6 +1047,47 @@ async function getUserById(env, userId) {
      WHERE id = ?
      LIMIT 1`
   ).bind(userId).first();
+}
+
+async function getUserByApiKey(env, apiKey) {
+  if (!isValidApiKey(apiKey)) {
+    return null;
+  }
+
+  const keyHash = await sha256Base64url(apiKey);
+  const row = await env.MAIL_DB.prepare(
+    `SELECT
+       u.id,
+       u.username,
+       u.password_hash,
+       u.password_salt,
+       u.credits,
+       u.created_at,
+       k.id AS api_key_id
+     FROM user_api_keys k
+     JOIN users u ON u.id = k.user_id
+     WHERE k.key_hash = ? AND k.revoked_at IS NULL
+     LIMIT 1`
+  ).bind(keyHash).first();
+
+  if (!row) {
+    return null;
+  }
+
+  await env.MAIL_DB.prepare(
+    `UPDATE user_api_keys
+     SET last_used_at = CURRENT_TIMESTAMP
+     WHERE id = ?`
+  ).bind(row.api_key_id).run();
+
+  return {
+    id: row.id,
+    username: row.username,
+    password_hash: row.password_hash,
+    password_salt: row.password_salt,
+    credits: row.credits,
+    created_at: row.created_at,
+  };
 }
 
 async function hashPassword(password, salt = randomHex(16)) {
@@ -1005,6 +1177,11 @@ async function hmacSha256(secret, data) {
   return crypto.subtle.sign("HMAC", key, new TextEncoder().encode(data));
 }
 
+async function sha256Base64url(value) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return base64urlEncodeBytes(digest);
+}
+
 async function debitCredits(env, userId, amount) {
   const result = await env.MAIL_DB.prepare(
     `UPDATE users
@@ -1051,6 +1228,18 @@ function mailListRow(mail) {
     raw_size: mail.raw_size,
     message_id: mail.message_id || "",
     created_at: mail.created_at,
+  };
+}
+
+function apiKeyRow(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    key_prefix: row.key_prefix,
+    created_at: row.created_at,
+    last_used_at: row.last_used_at,
+    revoked_at: row.revoked_at,
+    active: !row.revoked_at,
   };
 }
 
@@ -1114,6 +1303,10 @@ function createRedeemCode() {
   return `SM-${randomHex(4)}-${randomHex(4)}-${randomHex(4)}`.toUpperCase();
 }
 
+function createApiKey() {
+  return `smk_${randomHex(32)}`;
+}
+
 function randomHex(length) {
   const bytes = new Uint8Array(Math.ceil(length / 2));
   crypto.getRandomValues(bytes);
@@ -1138,6 +1331,20 @@ function normalizePassword(value) {
   }
 
   return password;
+}
+
+function normalizeApiKeyName(value) {
+  const name = String(value || "").trim();
+
+  if (name.length < 1 || name.length > 40) {
+    throw httpError("invalid_api_key_name", 400);
+  }
+
+  return name;
+}
+
+function isValidApiKey(value) {
+  return /^smk_[a-f0-9]{32}$/.test(String(value || "").trim());
 }
 
 function normalizeRedeemCode(value) {
@@ -1673,6 +1880,20 @@ function getAppHtml(env) {
       font-size: 12px;
     }
 
+    .item-actions {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      margin-top: 10px;
+    }
+
+    .button.mini {
+      min-height: 34px;
+      padding: 0 12px;
+      font-size: 12px;
+    }
+
     .mail-list {
       display: grid;
       gap: 10px;
@@ -1780,6 +2001,8 @@ function getAppHtml(env) {
       color: var(--muted);
       font-size: 12px;
       line-height: 1.7;
+      white-space: pre-wrap;
+      word-break: break-word;
     }
 
     @media (max-width: 980px) {
@@ -1885,6 +2108,19 @@ function getAppHtml(env) {
           </form>
 
           <div class="admin-box">
+            <h3 class="panel-title">脚本 API 密钥</h3>
+            <p class="hint">给 nvidia-register 这类脚本用：把这里生成的密钥填到脚本 .env 的 EMAIL_AUTH，它只能消耗并读取当前账号自己的邮箱池。</p>
+            <form class="form" id="apiKeyForm">
+              <label>密钥名称
+                <input name="name" placeholder="nvidia-register">
+              </label>
+              <button class="button secondary" type="submit">生成用户 API Key</button>
+            </form>
+            <div class="result-box hidden" id="apiKeyResult"></div>
+            <div class="stack" id="apiKeyList"></div>
+          </div>
+
+          <div class="admin-box">
             <h3 class="panel-title">管理员发码</h3>
             <p class="hint">用 EMAIL_AUTH 管理员密钥生成兑换码，例如 50 次或 100 次，发给买家后让他自己注册并兑换。</p>
             <form class="form" id="adminCodeForm">
@@ -1976,6 +2212,7 @@ function getAppHtml(env) {
       token: localStorage.getItem("small_mailbox_token") || "",
       user: null,
       domains: window.APP_CONFIG.domains || [],
+      apiKeys: [],
       addresses: [],
       selectedAddress: "",
       mails: [],
@@ -1995,6 +2232,9 @@ function getAppHtml(env) {
       profileCredits: document.getElementById("profileCredits"),
       heroCredits: document.getElementById("heroCredits"),
       redeemForm: document.getElementById("redeemForm"),
+      apiKeyForm: document.getElementById("apiKeyForm"),
+      apiKeyList: document.getElementById("apiKeyList"),
+      apiKeyResult: document.getElementById("apiKeyResult"),
       adminCodeForm: document.getElementById("adminCodeForm"),
       adminResult: document.getElementById("adminResult"),
       singleAddressForm: document.getElementById("singleAddressForm"),
@@ -2104,6 +2344,31 @@ function getAppHtml(env) {
       }).join("");
     }
 
+    function renderApiKeys() {
+      if (!state.user) {
+        nodes.apiKeyList.innerHTML = "";
+        nodes.apiKeyResult.classList.add("hidden");
+        return;
+      }
+
+      const activeKeys = state.apiKeys.filter(function (key) { return key.active; });
+      if (!activeKeys.length) {
+        nodes.apiKeyList.innerHTML = '<div class="empty">还没有用户 API Key。生成后可直接给脚本使用。</div>';
+        return;
+      }
+
+      nodes.apiKeyList.innerHTML = activeKeys.map(function (key) {
+        return '<div class="item">' +
+          '<strong>' + escapeHtml(key.name || "default") + '</strong>' +
+          '<span>' + escapeHtml(key.key_prefix) + '•••• · 创建于 ' + escapeHtml(key.created_at || "") + '</span>' +
+          '<div class="item-actions">' +
+          '<span>最近使用：' + escapeHtml(key.last_used_at || "从未") + '</span>' +
+          '<button class="button secondary mini" data-revoke-key="' + escapeHtml(key.id) + '" type="button">吊销</button>' +
+          '</div>' +
+          '</div>';
+      }).join("");
+    }
+
     function renderMails() {
       if (!state.selectedAddress) {
         nodes.mailList.innerHTML = '<div class="empty">选择一个邮箱后查看收件箱。</div>';
@@ -2153,6 +2418,13 @@ function getAppHtml(env) {
       renderDomains();
       renderAccount();
       await loadAddresses();
+      await loadApiKeys();
+    }
+
+    async function loadApiKeys() {
+      const data = await api("/app/api/api_keys");
+      state.apiKeys = data.results || data.data || [];
+      renderApiKeys();
     }
 
     async function loadAddresses() {
@@ -2202,6 +2474,7 @@ function getAppHtml(env) {
         localStorage.setItem("small_mailbox_token", state.token);
         renderAccount();
         await loadAddresses();
+        await loadApiKeys();
         toast("已进入控制台");
       } catch (error) {
         toast(error.message);
@@ -2227,11 +2500,13 @@ function getAppHtml(env) {
       localStorage.removeItem("small_mailbox_token");
       state.token = "";
       state.user = null;
+      state.apiKeys = [];
       state.addresses = [];
       state.mails = [];
       state.selectedAddress = "";
       state.selectedMail = null;
       renderAccount();
+      renderApiKeys();
       renderAddresses();
       renderMails();
       toast("已退出");
@@ -2253,6 +2528,46 @@ function getAppHtml(env) {
         toast(error.message);
       } finally {
         setBusy(nodes.redeemForm, false);
+      }
+    });
+
+    nodes.apiKeyForm.addEventListener("submit", async function (event) {
+      event.preventDefault();
+      setBusy(nodes.apiKeyForm, true);
+      try {
+        const data = await api("/app/api/api_keys", {
+          method: "POST",
+          body: JSON.stringify(formJson(nodes.apiKeyForm))
+        });
+        const domain = nodes.singleDomain.value || window.APP_CONFIG.defaultDomain || "";
+        const envText = "EMAIL_API=" + location.origin + "\\n" +
+          "EMAIL_AUTH=" + data.api_key + "\\n" +
+          "EMAIL_DOMAIN=" + domain;
+        nodes.apiKeyResult.classList.remove("hidden");
+        nodes.apiKeyResult.textContent = envText;
+        await copyText(data.api_key);
+        await loadApiKeys();
+        nodes.apiKeyForm.reset();
+        toast("用户 API Key 已生成并复制");
+      } catch (error) {
+        toast(error.message);
+      } finally {
+        setBusy(nodes.apiKeyForm, false);
+      }
+    });
+
+    nodes.apiKeyList.addEventListener("click", async function (event) {
+      const button = event.target.closest("[data-revoke-key]");
+      if (!button) return;
+      try {
+        await api("/app/api/api_keys/revoke", {
+          method: "POST",
+          body: JSON.stringify({ id: Number(button.dataset.revokeKey) })
+        });
+        await loadApiKeys();
+        toast("API Key 已吊销");
+      } catch (error) {
+        toast(error.message);
       }
     });
 
@@ -2355,6 +2670,7 @@ function getAppHtml(env) {
 
     renderDomains();
     renderAccount();
+    renderApiKeys();
     renderAddresses();
     renderMails();
 

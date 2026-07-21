@@ -8,6 +8,7 @@ Cloudflare Workers 上的轻量域名邮箱面板，保留 `nvidia-register` 需
 - 无限前缀：只要域名配置了 Email Routing catch-all，`001@域名`、`002@域名`、`jsbxbx@域名` 都能收。
 - 次数售卖：管理员生成 50/100 次兑换码，用户注册后兑换；每创建 1 个邮箱消耗 1 次。
 - 批量创建：随机批量生成，或用 `nv + 001/002/003` 这类编号批量创建。
+- 用户 API Key：买家可以生成自己的 `EMAIL_AUTH`，直接给脚本调用，不需要你的管理员密钥。
 - 邮件存储：D1 保存索引；R2 保存完整 raw 邮件，KV 可作为 fallback。
 
 ## 兼容接口
@@ -20,6 +21,11 @@ Cloudflare Workers 上的轻量域名邮箱面板，保留 `nvidia-register` 需
 
 这些接口不要删，`nvidia-register` 可以继续直接对接。
 
+`POST /admin/new_address` 现在支持两类 `EMAIL_AUTH`：
+
+- 管理员密钥：也就是 Worker 环境变量里的 `EMAIL_AUTH`，创建地址不扣用户额度。
+- 用户 API Key：用户在网页里生成，创建地址会扣该用户 1 次额度，并自动归属到他的邮箱池。
+
 ## 网页接口
 
 | 功能 | 方法 | 路径 |
@@ -29,11 +35,32 @@ Cloudflare Workers 上的轻量域名邮箱面板，保留 `nvidia-register` 需
 | 当前用户 | `GET` | `/app/api/me` |
 | 兑换次数 | `POST` | `/app/api/redeem` |
 | 地址列表 | `GET` | `/app/api/addresses` |
+| API Key 列表 | `GET` | `/app/api/api_keys` |
+| 创建 API Key | `POST` | `/app/api/api_keys` |
+| 吊销 API Key | `POST` | `/app/api/api_keys/revoke` |
 | 创建 1 个地址 | `POST` | `/app/api/addresses` |
 | 批量创建地址 | `POST` | `/app/api/addresses/batch` |
 | 用户邮件列表 | `GET` | `/app/api/mails?address=xxx@domain` |
 | 用户邮件详情 | `GET` | `/app/api/mail/{id}` |
 | 管理员生成兑换码 | `POST` | `/admin/redeem_codes` |
+
+`/app/api/*` 的用户接口可以用两种 Bearer：
+
+- 网页登录返回的用户 session token。
+- 用户在网页里生成的 `smk_...` API Key。
+
+也就是说，买家可以直接用自己的 API Key 查自己的邮箱池：
+
+```bash
+curl "https://你的-worker-域名/app/api/addresses" ^
+  -H "Authorization: Bearer smk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+curl "https://你的-worker-域名/app/api/mails?address=001@tyrlink.dpdns.org&limit=20&offset=0" ^
+  -H "Authorization: Bearer smk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+curl "https://你的-worker-域名/app/api/mail/mail_xxx" ^
+  -H "Authorization: Bearer smk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+```
 
 ## Cloudflare 手动配置
 
@@ -70,8 +97,49 @@ Worker 首次 API 请求会自动建表和迁移 `addresses.user_id`。如果你
 2. 你打开 Worker 根路径 `/`，在“管理员发码”里输入 `EMAIL_AUTH`。
 3. 生成一个 50 次或 100 次兑换码。
 4. 买家自己注册账号、兑换次数。
-5. 买家批量创建邮箱，或一个一个创建 `001`、`002`、`jsbxbx` 等自定义前缀。
-6. 买家在网页里查看这些邮箱收到的邮件和验证码。
+5. 买家在“脚本 API 密钥”里生成自己的用户 API Key。
+6. 买家可以在网页里批量创建邮箱，也可以把 API Key 填进脚本 `.env` 自动创建。
+7. 买家在网页或 API 里查看这些邮箱收到的邮件和验证码。
+
+## 买家脚本 `.env`
+
+买家的 `.env` 不要填你的管理员密钥，填他自己网页里生成的用户 API Key：
+
+```ini
+EMAIL_API=https://你的-worker-域名
+EMAIL_AUTH=smk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+EMAIL_DOMAIN=tyrlink.dpdns.org
+NV_PASSWORD=买家的 NVIDIA 密码
+```
+
+调用流程和 `EMAIL_API_SPEC.md` 一样：
+
+```text
+1. POST /admin/new_address
+   Header: x-admin-auth: 用户 API Key
+   Body: {"name":"001","domain":"tyrlink.dpdns.org","enablePrefix":false}
+   -> 返回 { address, jwt }，并扣该用户 1 次额度
+
+2. GET /api/mails?limit=5&offset=0
+   Header: Authorization: Bearer {jwt}
+
+3. GET /api/mail/{id}
+   Header: Authorization: Bearer {jwt}
+   -> 返回 { raw }
+```
+
+如果买家的脚本想“查整个邮箱池”，不用走单邮箱 JWT，可以直接用用户 API Key：
+
+```text
+GET /app/api/addresses
+Authorization: Bearer 用户 API Key
+
+GET /app/api/mails?address=某个已拥有邮箱&limit=20&offset=0
+Authorization: Bearer 用户 API Key
+
+GET /app/api/mail/{id}
+Authorization: Bearer 用户 API Key
+```
 
 ## 本地开发
 
@@ -100,7 +168,7 @@ npm run deploy
 
 ```ini
 EMAIL_API=https://你的-worker-域名
-EMAIL_AUTH=和 Worker 里的 EMAIL_AUTH 一致
+EMAIL_AUTH=管理员密钥或买家自己的用户 API Key
 EMAIL_DOMAIN=tyrlink.dpdns.org
 NV_PASSWORD=你的 NVIDIA 密码
 ```

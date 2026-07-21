@@ -46,6 +46,17 @@ CREATE TABLE IF NOT EXISTS redeem_uses (
   UNIQUE(user_id, code)
 );
 
+CREATE TABLE IF NOT EXISTS user_api_keys (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  name TEXT NOT NULL DEFAULT 'default',
+  key_prefix TEXT NOT NULL,
+  key_hash TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  last_used_at TEXT,
+  revoked_at TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_addresses_user
 ON addresses(user_id, created_at DESC);
 
@@ -57,3 +68,6 @@ ON mails(message_id);
 
 CREATE INDEX IF NOT EXISTS idx_redeem_uses_code
 ON redeem_uses(code, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_user_api_keys_user
+ON user_api_keys(user_id, created_at DESC);
