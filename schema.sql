@@ -1,7 +1,17 @@
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  password_salt TEXT NOT NULL,
+  credits INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS addresses (
   address TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   domain TEXT NOT NULL,
+  user_id INTEGER,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   last_jwt_iat INTEGER
 );
@@ -19,8 +29,31 @@ CREATE TABLE IF NOT EXISTS mails (
   FOREIGN KEY (address) REFERENCES addresses(address) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS redeem_codes (
+  code TEXT PRIMARY KEY,
+  credits INTEGER NOT NULL,
+  max_uses INTEGER NOT NULL DEFAULT 1,
+  used_count INTEGER NOT NULL DEFAULT 0,
+  expires_at TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS redeem_uses (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  code TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(user_id, code)
+);
+
+CREATE INDEX IF NOT EXISTS idx_addresses_user
+ON addresses(user_id, created_at DESC);
+
 CREATE INDEX IF NOT EXISTS idx_mails_address_created
 ON mails(address, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_mails_message_id
 ON mails(message_id);
+
+CREATE INDEX IF NOT EXISTS idx_redeem_uses_code
+ON redeem_uses(code, created_at DESC);

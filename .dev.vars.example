@@ -1,2 +1,7 @@
 EMAIL_AUTH=replace-with-a-long-admin-secret
 JWT_SECRET=replace-with-a-different-long-jwt-secret
+EMAIL_DOMAIN=tyrlink.dpdns.org
+ALLOW_REGISTRATION=true
+MAX_BATCH_CREATE=100
+RETENTION_HOURS=0
+MAX_RAW_BYTES=2097152
