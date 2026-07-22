@@ -2347,6 +2347,11 @@ function getLegacyAppHtml(env) {
       accountPanel: document.getElementById("accountPanel"),
       loginTab: document.getElementById("loginTab"),
       registerTab: document.getElementById("registerTab"),
+      loginDesc: document.getElementById("loginDesc"),
+      switchText: document.getElementById("switchText"),
+      authSwitchButton: document.getElementById("authSwitchButton"),
+      adminToggleButton: document.getElementById("adminToggleButton"),
+      adminPanel: document.getElementById("adminPanel"),
       loginForm: document.getElementById("loginForm"),
       registerForm: document.getElementById("registerForm"),
       logoutButton: document.getElementById("logoutButton"),
@@ -2607,6 +2612,17 @@ function getLegacyAppHtml(env) {
 
     nodes.loginTab.addEventListener("click", function () { setAuthMode("login"); });
     nodes.registerTab.addEventListener("click", function () { setAuthMode("register"); });
+    nodes.authSwitchButton.addEventListener("click", function () {
+      setAuthMode(state.authMode === "login" ? "register" : "login");
+    });
+    nodes.adminToggleButton.addEventListener("click", function () {
+      if (nodes.adminPanel.dataset.open) {
+        delete nodes.adminPanel.dataset.open;
+      } else {
+        nodes.adminPanel.dataset.open = "true";
+      }
+      renderAdmin();
+    });
 
     nodes.loginForm.addEventListener("submit", function (event) {
       event.preventDefault();
@@ -2973,6 +2989,152 @@ function getAppHtml(env) {
       align-items: start;
     }
 
+    body.auth-mode {
+      min-height: 100vh;
+      overflow-x: hidden;
+      background: #e8edf5;
+    }
+
+    body.auth-mode .topbar {
+      display: none;
+    }
+
+    body.auth-mode .page {
+      width: 100%;
+      min-height: 100vh;
+      margin: 0;
+    }
+
+    .login-shell {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 476px;
+      background: #e8edf5;
+    }
+
+    .login-visual {
+      position: relative;
+      min-height: 100vh;
+      overflow: hidden;
+      background:
+        linear-gradient(90deg, rgba(2, 18, 56, 0.86), rgba(21, 74, 171, 0.44)),
+        radial-gradient(circle at 64% 18%, rgba(255, 255, 255, 0.7) 0 1px, transparent 2px),
+        radial-gradient(circle at 22% 24%, rgba(255, 255, 255, 0.76) 0 1px, transparent 2px),
+        linear-gradient(145deg, #061238 0%, #123d89 48%, #7aa7e6 100%);
+    }
+
+    .login-visual::before,
+    .login-visual::after {
+      content: "";
+      position: absolute;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.18);
+      filter: blur(2px);
+    }
+
+    .login-visual::before {
+      width: 460px;
+      height: 150px;
+      left: 10%;
+      bottom: 16%;
+      box-shadow: 260px -60px 0 rgba(255, 255, 255, 0.10), 520px 22px 0 rgba(255, 255, 255, 0.08);
+    }
+
+    .login-visual::after {
+      width: 6px;
+      height: 6px;
+      right: 26%;
+      top: 14%;
+      box-shadow:
+        36px 44px 0 rgba(255, 244, 209, 0.92),
+        72px 16px 0 rgba(255, 255, 255, 0.72),
+        -62px 84px 0 rgba(255, 255, 255, 0.55),
+        118px 98px 0 rgba(255, 219, 150, 0.75);
+    }
+
+    .visual-copy {
+      position: absolute;
+      left: clamp(36px, 6vw, 88px);
+      bottom: clamp(40px, 8vw, 108px);
+      width: min(520px, calc(100% - 72px));
+      color: #fff;
+      z-index: 1;
+    }
+
+    .visual-brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 22px;
+      font-size: 18px;
+      font-weight: 800;
+    }
+
+    .visual-copy h1 {
+      margin: 0 0 14px;
+      font-size: clamp(34px, 4.4vw, 62px);
+      line-height: 1.05;
+      letter-spacing: -0.05em;
+    }
+
+    .visual-copy p {
+      max-width: 480px;
+      margin: 0;
+      color: rgba(255, 255, 255, 0.78);
+      font-size: 16px;
+      line-height: 1.9;
+    }
+
+    .login-side {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 34px;
+      background:
+        radial-gradient(circle at 85% 18%, rgba(255, 255, 255, 0.8), transparent 120px),
+        rgba(238, 242, 248, 0.96);
+      border-left: 1px solid rgba(210, 217, 229, 0.8);
+    }
+
+    .login-card {
+      width: 100%;
+      max-width: 416px;
+    }
+
+    .login-card h2 {
+      margin: 0 0 8px;
+      font-size: 26px;
+      letter-spacing: -0.03em;
+    }
+
+    .login-card > .hint {
+      margin-bottom: 22px;
+    }
+
+    .login-card .tabs {
+      margin-bottom: 16px;
+    }
+
+    .switch-row {
+      margin-top: 20px;
+      text-align: center;
+      color: #566275;
+    }
+
+    .text-link {
+      padding: 0;
+      color: #1685f4;
+      background: transparent;
+      font-weight: 700;
+    }
+
+    .admin-login-box {
+      margin-top: 22px;
+      padding-top: 18px;
+      border-top: 1px solid rgba(211, 218, 229, 0.9);
+    }
+
     .grid-2 {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -3337,6 +3499,14 @@ function getAppHtml(env) {
         grid-template-columns: 1fr;
       }
 
+      .login-shell {
+        grid-template-columns: 1fr;
+      }
+
+      .login-visual {
+        display: none;
+      }
+
       .address-pane {
         border-right: 0;
         border-bottom: 1px solid #edf1f6;
@@ -3378,25 +3548,38 @@ function getAppHtml(env) {
   </header>
 
   <main class="page">
-    <section class="auth-grid" id="authPanel">
-      <div class="card">
-        <div class="card-header">
-          <div class="card-title">用户入口</div>
+    <section class="login-shell" id="authPanel">
+      <div class="login-visual" aria-hidden="true">
+        <div class="visual-copy">
+          <div class="visual-brand">
+            <span class="brand-mark"></span>
+            <span>Small Mailbox</span>
+          </div>
+          <h1>Cloud Mail</h1>
+          <p>一个给买家分配次数、批量创建域名邮箱、接收验证码的轻量邮箱池。</p>
+        </div>
+      </div>
+
+      <aside class="login-side">
+        <div class="login-card">
+          <h2>Small Mailbox</h2>
+          <p class="hint" id="loginDesc">输入账号信息以开始使用邮箱系统</p>
+
           <div class="tabs">
             <button class="tab active" id="loginTab" type="button">登录</button>
             <button class="tab" id="registerTab" type="button">注册</button>
           </div>
-        </div>
-        <div class="card-body">
+
           <form class="form" id="loginForm">
             <label>账号
               <input name="username" autocomplete="username" placeholder="buyer001">
             </label>
             <label>密码
-              <input name="password" type="password" autocomplete="current-password" placeholder="至少 6 位">
+              <input name="password" type="password" autocomplete="current-password" placeholder="密码">
             </label>
-            <button class="button" type="submit">登录邮箱池</button>
+            <button class="button" type="submit">登录</button>
           </form>
+
           <form class="form hidden" id="registerForm">
             <label>账号
               <input name="username" autocomplete="username" placeholder="buyer001">
@@ -3407,33 +3590,31 @@ function getAppHtml(env) {
             <label>激活码
               <input name="code" placeholder="SM-XXXX-XXXX-XXXX">
             </label>
-            <button class="button" type="submit">注册并激活次数</button>
-            <p class="hint">激活码由管理员生成。注册成功后，次数会直接进入这个账号。</p>
+            <button class="button" type="submit">创建账号</button>
           </form>
-        </div>
-      </div>
 
-      <section class="card" id="adminPanel">
-        <div class="card-header">
-          <div class="card-title">管理员</div>
-          <span class="badge hidden" id="adminBadge">已登录</span>
-        </div>
-        <div class="card-body section-stack">
-          <form class="form" id="adminLoginForm">
-            <div class="grid-2">
+          <div class="switch-row">
+            <span id="switchText">还没有账号？</span>
+            <button class="text-link" id="authSwitchButton" type="button">创建账号</button>
+            <span> · </span>
+            <button class="text-link" id="adminToggleButton" type="button">管理员入口</button>
+          </div>
+
+          <section class="admin-login-box hidden" id="adminPanel">
+            <div class="card-title">管理员</div>
+            <span class="badge hidden" id="adminBadge">已登录</span>
+            <form class="form" id="adminLoginForm">
               <label>管理员账号
                 <input name="username" autocomplete="username" placeholder="admin">
               </label>
               <label>管理员密码
                 <input name="password" type="password" autocomplete="current-password" placeholder="ADMIN_PASSWORD">
               </label>
-            </div>
-            <button class="button" type="submit">登录管理员</button>
-            <p class="hint">默认账号是 admin；密码优先用 ADMIN_PASSWORD，没填就用 EMAIL_AUTH。</p>
-          </form>
+              <button class="button secondary" type="submit">登录管理员</button>
+              <p class="hint">默认账号 admin；密码优先用 ADMIN_PASSWORD，没填就用 EMAIL_AUTH。</p>
+            </form>
 
-          <div class="section-stack hidden" id="adminSessionPanel">
-            <div class="grid-2">
+            <div class="section-stack hidden" id="adminSessionPanel">
               <div class="sub-card">
                 <p class="sub-title">生成激活码</p>
                 <form class="form" id="adminCodeForm">
@@ -3448,16 +3629,13 @@ function getAppHtml(env) {
                   <button class="button" type="submit">生成激活码</button>
                 </form>
               </div>
-              <div class="sub-card">
-                <p class="sub-title">管理员状态</p>
-                <p class="hint" id="adminName">-</p>
-                <button class="button secondary" id="adminLogoutButton" type="button">退出管理员</button>
-              </div>
+              <p class="hint" id="adminName">-</p>
+              <button class="button secondary" id="adminLogoutButton" type="button">退出管理员</button>
+              <div class="result-box hidden" id="adminResult"></div>
             </div>
-            <div class="result-box hidden" id="adminResult"></div>
-          </div>
+          </section>
         </div>
-      </section>
+      </aside>
     </section>
 
     <section class="section-stack hidden" id="appPanel">
@@ -3707,10 +3885,14 @@ function getAppHtml(env) {
 
     function setAuthMode(mode) {
       state.authMode = mode;
-      nodes.loginTab.classList.toggle("active", mode === "login");
-      nodes.registerTab.classList.toggle("active", mode === "register");
-      nodes.loginForm.classList.toggle("hidden", mode !== "login");
-      nodes.registerForm.classList.toggle("hidden", mode !== "register");
+      const isLogin = mode === "login";
+      nodes.loginTab.classList.toggle("active", isLogin);
+      nodes.registerTab.classList.toggle("active", !isLogin);
+      nodes.loginForm.classList.toggle("hidden", !isLogin);
+      nodes.registerForm.classList.toggle("hidden", isLogin);
+      nodes.loginDesc.textContent = isLogin ? "输入账号信息以开始使用邮箱系统" : "输入激活码创建账号并获得次数";
+      nodes.switchText.textContent = isLogin ? "还没有账号？" : "已有账号？";
+      nodes.authSwitchButton.textContent = isLogin ? "创建账号" : "返回登录";
     }
 
     function renderDomains() {
@@ -3724,6 +3906,7 @@ function getAppHtml(env) {
 
     function renderUser() {
       const loggedIn = Boolean(state.user);
+      document.body.classList.toggle("auth-mode", !loggedIn);
       nodes.authPanel.classList.toggle("hidden", loggedIn);
       nodes.appPanel.classList.toggle("hidden", !loggedIn);
       nodes.logoutButton.classList.toggle("hidden", !loggedIn);
@@ -3736,6 +3919,7 @@ function getAppHtml(env) {
 
     function renderAdmin() {
       const loggedIn = Boolean(state.admin);
+      nodes.adminPanel.classList.toggle("hidden", !loggedIn && !nodes.adminPanel.dataset.open);
       nodes.adminLoginForm.classList.toggle("hidden", loggedIn);
       nodes.adminSessionPanel.classList.toggle("hidden", !loggedIn);
       nodes.adminBadge.classList.toggle("hidden", !loggedIn);
