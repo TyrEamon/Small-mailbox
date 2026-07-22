@@ -54,81 +54,81 @@ export default {
       await ensureSchema(env);
 
       if (request.method === "POST" && path === "/auth/login") {
-        return handleUnifiedLogin(request, env);
+        return await handleUnifiedLogin(request, env);
       }
 
       if (request.method === "POST" && path === "/admin/login") {
-        return handleAdminLogin(request, env);
+        return await handleAdminLogin(request, env);
       }
 
       if (request.method === "GET" && path === "/admin/me") {
-        return handleAdminMe(request, env);
+        return await handleAdminMe(request, env);
       }
 
       if (request.method === "POST" && path === "/admin/new_address") {
-        return handleNewAddress(request, env);
+        return await handleNewAddress(request, env);
       }
 
       if (request.method === "POST" && path === "/admin/redeem_codes") {
-        return handleCreateRedeemCode(request, env);
+        return await handleCreateRedeemCode(request, env);
       }
 
       if (request.method === "POST" && path === "/app/api/register") {
-        return handleRegister(request, env);
+        return await handleRegister(request, env);
       }
 
       if (request.method === "POST" && path === "/app/api/login") {
-        return handleLogin(request, env);
+        return await handleLogin(request, env);
       }
 
       if (request.method === "GET" && path === "/app/api/me") {
-        return handleMe(request, env);
+        return await handleMe(request, env);
       }
 
       if (request.method === "POST" && path === "/app/api/redeem") {
-        return handleRedeem(request, env);
+        return await handleRedeem(request, env);
       }
 
       if (request.method === "GET" && path === "/app/api/api_keys") {
-        return handleApiKeyList(request, env);
+        return await handleApiKeyList(request, env);
       }
 
       if (request.method === "POST" && path === "/app/api/api_keys") {
-        return handleCreateApiKey(request, env);
+        return await handleCreateApiKey(request, env);
       }
 
       if (request.method === "POST" && path === "/app/api/api_keys/revoke") {
-        return handleRevokeApiKey(request, env);
+        return await handleRevokeApiKey(request, env);
       }
 
       if (request.method === "GET" && path === "/app/api/addresses") {
-        return handleAppAddressList(request, env);
+        return await handleAppAddressList(request, env);
       }
 
       if (request.method === "POST" && path === "/app/api/addresses") {
-        return handleCreateAppAddress(request, env);
+        return await handleCreateAppAddress(request, env);
       }
 
       if (request.method === "POST" && path === "/app/api/addresses/batch") {
-        return handleCreateAppAddressBatch(request, env);
+        return await handleCreateAppAddressBatch(request, env);
       }
 
       if (request.method === "GET" && path === "/app/api/mails") {
-        return handleAppMailList(request, env, url);
+        return await handleAppMailList(request, env, url);
       }
 
       if (request.method === "GET" && path.startsWith("/app/api/mail/")) {
         const id = decodeURIComponent(path.slice("/app/api/mail/".length));
-        return handleAppMailDetail(request, env, id);
+        return await handleAppMailDetail(request, env, id);
       }
 
       if (request.method === "GET" && path === "/api/mails") {
-        return handleMailList(request, env, url);
+        return await handleMailList(request, env, url);
       }
 
       if (request.method === "GET" && path.startsWith("/api/mail/")) {
         const id = decodeURIComponent(path.slice("/api/mail/".length));
-        return handleMailDetail(request, env, id);
+        return await handleMailDetail(request, env, id);
       }
 
       return errorJson("not_found", 404);
@@ -2454,7 +2454,7 @@ function getLegacyAppHtml(env) {
     }
 
     function setBusy(form, busy) {
-      Array.from(form.querySelectorAll("button, input, select")).forEach(function (node) {
+      Array.from(form.querySelectorAll("button")).forEach(function (node) {
         node.disabled = busy;
       });
     }
@@ -3908,7 +3908,7 @@ function getAppHtml(env) {
     }
 
     function setBusy(form, busy) {
-      Array.from(form.querySelectorAll("button, input, select")).forEach(function (node) {
+      Array.from(form.querySelectorAll("button")).forEach(function (node) {
         node.disabled = busy;
       });
     }
