@@ -3557,8 +3557,19 @@ function getAppHtml(env) {
 
     .mail-detail {
       min-height: 300px;
+      max-height: 560px;
       padding: 16px;
       overflow: auto;
+    }
+
+    .detail-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      margin-bottom: 10px;
     }
 
     .code-box {
@@ -3591,6 +3602,8 @@ function getAppHtml(env) {
     pre {
       margin: 0;
       min-height: 220px;
+      max-height: 430px;
+      overflow: auto;
       white-space: pre-wrap;
       word-break: break-word;
       border: 1px solid var(--line);
@@ -3837,6 +3850,7 @@ function getAppHtml(env) {
                   </div>
                   <button class="button secondary small" id="adminCopyCodeButton" type="button">复制</button>
                 </div>
+                <div class="detail-title">邮件原文 Raw</div>
                 <pre id="adminMailRaw">邮件原文会显示在这里。</pre>
               </div>
             </section>
@@ -3962,6 +3976,7 @@ function getAppHtml(env) {
                 </div>
                 <button class="button secondary small" id="copyCodeButton" type="button">复制</button>
               </div>
+              <div class="detail-title">邮件原文 Raw</div>
               <pre id="mailRaw">邮件原文会显示在这里。</pre>
             </div>
           </section>
@@ -4673,10 +4688,8 @@ function getAppHtml(env) {
 
     nodes.refreshButton.addEventListener("click", async function () {
       try {
-        if (state.selectedAddress) {
-          await loadMails(state.selectedAddress);
-          toast("已刷新");
-        }
+        await loadAddresses();
+        toast("已刷新收件箱");
       } catch (error) {
         toast(error.message);
       }
