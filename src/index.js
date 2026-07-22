@@ -4045,7 +4045,7 @@ function getAppHtml(env) {
                 </div>
                 <div class="detail-title">邮件预览</div>
                 <div class="mail-preview hidden" id="adminMailPreviewWrap">
-                  <iframe id="adminMailPreview" sandbox="" referrerpolicy="no-referrer"></iframe>
+                  <iframe id="adminMailPreview" sandbox="allow-same-origin" referrerpolicy="no-referrer"></iframe>
                 </div>
                 <details class="raw-details">
                   <summary>Raw 原文</summary>
@@ -4178,7 +4178,7 @@ function getAppHtml(env) {
               </div>
               <div class="detail-title">邮件预览</div>
               <div class="mail-preview hidden" id="mailPreviewWrap">
-                <iframe id="mailPreview" sandbox="" referrerpolicy="no-referrer"></iframe>
+                <iframe id="mailPreview" sandbox="allow-same-origin" referrerpolicy="no-referrer"></iframe>
               </div>
               <details class="raw-details">
                 <summary>Raw 原文</summary>
@@ -4560,7 +4560,10 @@ function getAppHtml(env) {
       }
 
       if (mail.html) {
-        frame.srcdoc = mail.html;
+        frame.onload = function () {
+          ensurePreviewVisible(frame, mail);
+        };
+        frame.srcdoc = buildEmailPreviewDoc(mail.html, mail);
         wrapper.classList.remove("hidden");
         return;
       }
@@ -4572,6 +4575,87 @@ function getAppHtml(env) {
       }
 
       clearMailPreview(wrapper, frame);
+    }
+
+    function buildEmailPreviewDoc(html, mail) {
+      const source = sanitizeEmailHtml(html);
+      const styles = extractEmailStyles(source);
+      const body = extractEmailBody(source);
+      const fallbackText = mail.text || textFromHtml(source) || textFromHtml(mail.raw || "");
+      return '<!doctype html><html><head><meta charset="utf-8">' +
+        '<base target="_blank">' +
+        styles +
+        '<style>' +
+        'html,body{margin:0!important;min-height:100%!important;background:#fff!important;color:#111827!important;}' +
+        'body{overflow:auto!important;-webkit-text-size-adjust:100%;}' +
+        '.mail-preview-root{min-height:160px;background:#fff;color:#111827;}' +
+        '.mail-preview-fallback{display:none;margin:0;padding:24px;white-space:pre-wrap;word-break:break-word;font:15px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;color:#111827;background:#fff;}' +
+        'img{max-width:100%;height:auto;}' +
+        'table{max-width:100%;}' +
+        '</style></head><body>' +
+        '<div class="mail-preview-root">' + body + '</div>' +
+        '<pre class="mail-preview-fallback">' + escapeHtml(fallbackText) + '</pre>' +
+        '</body></html>';
+    }
+
+    function sanitizeEmailHtml(html) {
+      return String(html || "")
+        .replace(/<script\b[\s\S]*?<\/script>/gi, "")
+        .replace(/<iframe\b[\s\S]*?<\/iframe>/gi, "")
+        .replace(/<object\b[\s\S]*?<\/object>/gi, "")
+        .replace(/<embed\b[\s\S]*?>/gi, "")
+        .replace(/<form\b[\s\S]*?<\/form>/gi, "")
+        .replace(/<meta\b[^>]*http-equiv=["']?refresh["']?[^>]*>/gi, "")
+        .replace(/\son[a-z]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, "")
+        .replace(/javascript:/gi, "");
+    }
+
+    function extractEmailStyles(html) {
+      return (String(html || "").match(/<style\b[^>]*>[\s\S]*?<\/style>/gi) || []).join("");
+    }
+
+    function extractEmailBody(html) {
+      const match = String(html || "").match(/<body\b[^>]*>([\s\S]*?)<\/body>/i);
+      return match ? match[1] : html;
+    }
+
+    function textFromHtml(html) {
+      const text = String(html || "")
+        .replace(/<style\b[\s\S]*?<\/style>/gi, " ")
+        .replace(/<script\b[\s\S]*?<\/script>/gi, " ")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/&nbsp;/gi, " ")
+        .replace(/&amp;/gi, "&")
+        .replace(/&lt;/gi, "<")
+        .replace(/&gt;/gi, ">")
+        .replace(/&#(\d+);/g, function (_, code) {
+          return String.fromCharCode(Number(code));
+        })
+        .replace(/\s+/g, " ")
+        .trim();
+      return text;
+    }
+
+    function ensurePreviewVisible(frame, mail) {
+      try {
+        const doc = frame.contentDocument;
+        const root = doc && doc.querySelector(".mail-preview-root");
+        const fallback = doc && doc.querySelector(".mail-preview-fallback");
+        if (!doc || !root || !fallback) return;
+
+        const hasVisibleText = root.innerText && root.innerText.trim().length > 0;
+        const hasVisibleBox = root.scrollHeight > 20 || root.getBoundingClientRect().height > 20;
+        if (!hasVisibleText && !hasVisibleBox) {
+          fallback.style.display = "block";
+        }
+
+        const height = Math.min(900, Math.max(320, doc.documentElement.scrollHeight || doc.body.scrollHeight || 560));
+        frame.style.height = height + "px";
+      } catch {
+        if (mail && (mail.text || mail.raw)) {
+          frame.srcdoc = '<!doctype html><meta charset="utf-8"><style>body{margin:0;padding:24px;background:#fff;color:#111827;font:15px/1.7 sans-serif}pre{white-space:pre-wrap;word-break:break-word;font:inherit}</style><pre>' + escapeHtml(mail.text || textFromHtml(mail.raw || "")) + '</pre>';
+        }
+      }
     }
 
     function skippedReasonText(reason) {
