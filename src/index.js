@@ -53,6 +53,10 @@ export default {
       ensureBindings(env);
       await ensureSchema(env);
 
+      if (request.method === "POST" && path === "/auth/login") {
+        return handleUnifiedLogin(request, env);
+      }
+
       if (request.method === "POST" && path === "/admin/login") {
         return handleAdminLogin(request, env);
       }
@@ -194,6 +198,31 @@ export default {
   },
 };
 
+async function handleUnifiedLogin(request, env) {
+  const body = await readJsonBody(request);
+  const username = String(body.username || "").trim();
+  const password = String(body.password || "");
+
+  if (safeEqual(username, getAdminUsername(env)) && safeEqual(password, getAdminPassword(env))) {
+    const token = await signAdminToken(env, username);
+    return json({
+      role: "admin",
+      token,
+      admin: {
+        username,
+      },
+    });
+  }
+
+  const user = await validateUserLogin(env, username, password);
+  const token = await signUserToken(env, user);
+
+  return json({
+    role: "user",
+    ...sessionPayload(user, token),
+  });
+}
+
 async function handleAdminLogin(request, env) {
   const body = await readJsonBody(request);
   const username = String(body.username || "").trim();
@@ -203,13 +232,7 @@ async function handleAdminLogin(request, env) {
     return errorJson("invalid_admin_login", 401);
   }
 
-  const now = Math.floor(Date.now() / 1000);
-  const token = await signJwt(env, {
-    type: "admin",
-    username,
-    iat: now,
-    exp: now + ADMIN_SESSION_TTL_SECONDS,
-  });
+  const token = await signAdminToken(env, username);
 
   return json({
     token,
@@ -336,14 +359,7 @@ async function handleRegister(request, env) {
 
 async function handleLogin(request, env) {
   const body = await readJsonBody(request);
-  const username = normalizeUsername(body.username);
-  const password = normalizePassword(body.password);
-  const user = await getUserByUsername(env, username);
-
-  if (!user || !(await verifyPassword(password, user.password_salt, user.password_hash))) {
-    return errorJson("invalid_login", 401);
-  }
-
+  const user = await validateUserLogin(env, body.username, body.password);
   const token = await signUserToken(env, user);
   return json(sessionPayload(user, token));
 }
@@ -1139,6 +1155,28 @@ async function signUserToken(env, user) {
     iat: now,
     exp: now + USER_SESSION_TTL_SECONDS,
   });
+}
+
+async function signAdminToken(env, username) {
+  const now = Math.floor(Date.now() / 1000);
+  return signJwt(env, {
+    type: "admin",
+    username,
+    iat: now,
+    exp: now + ADMIN_SESSION_TTL_SECONDS,
+  });
+}
+
+async function validateUserLogin(env, usernameValue, passwordValue) {
+  const username = normalizeUsername(usernameValue);
+  const password = normalizePassword(passwordValue);
+  const user = await getUserByUsername(env, username);
+
+  if (!user || !(await verifyPassword(password, user.password_salt, user.password_hash))) {
+    throw httpError("invalid_login", 401);
+  }
+
+  return user;
 }
 
 async function getUserByUsername(env, username) {
@@ -3596,48 +3634,46 @@ function getAppHtml(env) {
           <div class="switch-row">
             <span id="switchText">还没有账号？</span>
             <button class="text-link" id="authSwitchButton" type="button">创建账号</button>
-            <span> · </span>
-            <button class="text-link" id="adminToggleButton" type="button">管理员入口</button>
           </div>
-
-          <section class="admin-login-box hidden" id="adminPanel">
-            <div class="card-title">管理员</div>
-            <span class="badge hidden" id="adminBadge">已登录</span>
-            <form class="form" id="adminLoginForm">
-              <label>管理员账号
-                <input name="username" autocomplete="username" placeholder="admin">
-              </label>
-              <label>管理员密码
-                <input name="password" type="password" autocomplete="current-password" placeholder="ADMIN_PASSWORD">
-              </label>
-              <button class="button secondary" type="submit">登录管理员</button>
-              <p class="hint">默认账号 admin；密码优先用 ADMIN_PASSWORD，没填就用 EMAIL_AUTH。</p>
-            </form>
-
-            <div class="section-stack hidden" id="adminSessionPanel">
-              <div class="sub-card">
-                <p class="sub-title">生成激活码</p>
-                <form class="form" id="adminCodeForm">
-                  <div class="grid-2">
-                    <label>次数
-                      <input name="credits" type="number" min="1" value="50">
-                    </label>
-                    <label>可用人数
-                      <input name="maxUses" type="number" min="1" value="1">
-                    </label>
-                  </div>
-                  <button class="button" type="submit">生成激活码</button>
-                </form>
-              </div>
-              <p class="hint" id="adminName">-</p>
-              <button class="button secondary" id="adminLogoutButton" type="button">退出管理员</button>
-              <div class="result-box hidden" id="adminResult"></div>
-            </div>
-          </section>
         </div>
       </aside>
     </section>
 
+    <section class="section-stack hidden" id="adminAppPanel">
+      <section class="card">
+        <div class="card-header">
+          <div class="card-title">管理员控制台</div>
+          <button class="button ghost small" id="adminLogoutButton" type="button">退出</button>
+        </div>
+        <div class="card-body section-stack">
+          <div class="stats">
+            <div class="stat">
+              <span>管理员账号</span>
+              <strong id="adminName">-</strong>
+            </div>
+            <div class="stat">
+              <span>用途</span>
+              <strong>发码</strong>
+            </div>
+          </div>
+          <div class="sub-card">
+            <p class="sub-title">生成激活码</p>
+            <form class="form" id="adminCodeForm">
+              <div class="grid-2">
+                <label>次数
+                  <input name="credits" type="number" min="1" value="50">
+                </label>
+                <label>可用人数
+                  <input name="maxUses" type="number" min="1" value="1">
+                </label>
+              </div>
+              <button class="button" type="submit">生成激活码</button>
+            </form>
+            <div class="result-box hidden" id="adminResult"></div>
+          </div>
+        </div>
+      </section>
+    </section>
     <section class="section-stack hidden" id="appPanel">
       <section class="card">
         <div class="card-header">
@@ -3792,11 +3828,9 @@ function getAppHtml(env) {
       registerTab: document.getElementById("registerTab"),
       loginForm: document.getElementById("loginForm"),
       registerForm: document.getElementById("registerForm"),
-      adminLoginForm: document.getElementById("adminLoginForm"),
-      adminSessionPanel: document.getElementById("adminSessionPanel"),
+      adminAppPanel: document.getElementById("adminAppPanel"),
       adminCodeForm: document.getElementById("adminCodeForm"),
       adminLogoutButton: document.getElementById("adminLogoutButton"),
-      adminBadge: document.getElementById("adminBadge"),
       adminName: document.getElementById("adminName"),
       adminResult: document.getElementById("adminResult"),
       profileName: document.getElementById("profileName"),
@@ -3905,25 +3939,25 @@ function getAppHtml(env) {
     }
 
     function renderUser() {
-      const loggedIn = Boolean(state.user);
+      const userLoggedIn = Boolean(state.user);
+      const adminLoggedIn = Boolean(state.admin);
+      const loggedIn = userLoggedIn || adminLoggedIn;
       document.body.classList.toggle("auth-mode", !loggedIn);
       nodes.authPanel.classList.toggle("hidden", loggedIn);
-      nodes.appPanel.classList.toggle("hidden", !loggedIn);
+      nodes.appPanel.classList.toggle("hidden", !userLoggedIn);
+      nodes.adminAppPanel.classList.toggle("hidden", !adminLoggedIn);
       nodes.logoutButton.classList.toggle("hidden", !loggedIn);
-      nodes.topUser.textContent = loggedIn ? state.user.username : "未登录";
-      nodes.profileName.textContent = loggedIn ? state.user.username : "-";
-      nodes.profileCredits.textContent = loggedIn ? state.user.credits : "0";
+      nodes.topUser.textContent = userLoggedIn ? state.user.username : (adminLoggedIn ? state.admin.username + "（管理员）" : "未登录");
+      nodes.profileName.textContent = userLoggedIn ? state.user.username : "-";
+      nodes.profileCredits.textContent = userLoggedIn ? state.user.credits : "0";
       nodes.profileAddressCount.textContent = String(state.addresses.length || 0);
       nodes.profileApiKeyCount.textContent = String(state.apiKeys.filter(function (key) { return key.active; }).length || 0);
     }
 
     function renderAdmin() {
       const loggedIn = Boolean(state.admin);
-      nodes.adminPanel.classList.toggle("hidden", !loggedIn && !nodes.adminPanel.dataset.open);
-      nodes.adminLoginForm.classList.toggle("hidden", loggedIn);
-      nodes.adminSessionPanel.classList.toggle("hidden", !loggedIn);
-      nodes.adminBadge.classList.toggle("hidden", !loggedIn);
-      nodes.adminName.textContent = loggedIn ? ("当前管理员：" + state.admin.username) : "-";
+      nodes.adminAppPanel.classList.toggle("hidden", !loggedIn);
+      nodes.adminName.textContent = loggedIn ? state.admin.username : "-";
     }
 
     function renderAddresses() {
@@ -4032,6 +4066,7 @@ function getAppHtml(env) {
     async function loadAdminMe() {
       const data = await adminApi("/admin/me");
       state.admin = data.admin;
+      renderUser();
       renderAdmin();
     }
 
@@ -4087,11 +4122,37 @@ function getAppHtml(env) {
           method: "POST",
           body: JSON.stringify(formJson(form))
         });
+        if (data.role === "admin") {
+          state.adminToken = data.token;
+          state.admin = data.admin;
+          state.token = "";
+          state.user = null;
+          state.apiKeys = [];
+          state.addresses = [];
+          state.mails = [];
+          state.selectedAddress = "";
+          state.selectedMail = null;
+          localStorage.setItem("small_mailbox_admin_token", state.adminToken);
+          localStorage.removeItem("small_mailbox_token");
+          form.reset();
+          renderUser();
+          renderAdmin();
+          renderAddresses();
+          renderApiKeys();
+          renderMails();
+          toast("管理员已登录");
+          return;
+        }
+
         state.token = data.token;
         state.user = data.user;
+        state.adminToken = "";
+        state.admin = null;
         localStorage.setItem("small_mailbox_token", state.token);
+        localStorage.removeItem("small_mailbox_admin_token");
         form.reset();
         renderUser();
+        renderAdmin();
         await loadAddresses();
         await loadApiKeys();
         renderUser();
@@ -4108,7 +4169,7 @@ function getAppHtml(env) {
 
     nodes.loginForm.addEventListener("submit", function (event) {
       event.preventDefault();
-      authSubmit(nodes.loginForm, "/app/api/login");
+      authSubmit(nodes.loginForm, "/auth/login");
     });
 
     nodes.registerForm.addEventListener("submit", function (event) {
@@ -4118,39 +4179,22 @@ function getAppHtml(env) {
 
     nodes.logoutButton.addEventListener("click", function () {
       localStorage.removeItem("small_mailbox_token");
+      localStorage.removeItem("small_mailbox_admin_token");
       state.token = "";
       state.user = null;
+      state.adminToken = "";
+      state.admin = null;
       state.apiKeys = [];
       state.addresses = [];
       state.mails = [];
       state.selectedAddress = "";
       state.selectedMail = null;
       renderUser();
+      renderAdmin();
       renderAddresses();
       renderApiKeys();
       renderMails();
-      toast("已退出用户");
-    });
-
-    nodes.adminLoginForm.addEventListener("submit", async function (event) {
-      event.preventDefault();
-      setBusy(nodes.adminLoginForm, true);
-      try {
-        const data = await requestJson("/admin/login", {
-          method: "POST",
-          body: JSON.stringify(formJson(nodes.adminLoginForm))
-        });
-        state.adminToken = data.token;
-        state.admin = data.admin;
-        localStorage.setItem("small_mailbox_admin_token", state.adminToken);
-        nodes.adminLoginForm.reset();
-        renderAdmin();
-        toast("管理员已登录");
-      } catch (error) {
-        toast(error.message);
-      } finally {
-        setBusy(nodes.adminLoginForm, false);
-      }
+      toast("已退出");
     });
 
     nodes.adminLogoutButton.addEventListener("click", function () {
@@ -4159,6 +4203,7 @@ function getAppHtml(env) {
       state.admin = null;
       nodes.adminResult.classList.add("hidden");
       nodes.adminResult.textContent = "";
+      renderUser();
       renderAdmin();
       toast("管理员已退出");
     });
@@ -4183,6 +4228,7 @@ function getAppHtml(env) {
           localStorage.removeItem("small_mailbox_admin_token");
           state.adminToken = "";
           state.admin = null;
+          renderUser();
           renderAdmin();
         }
         toast(error.message);
@@ -4358,6 +4404,7 @@ function getAppHtml(env) {
         localStorage.removeItem("small_mailbox_admin_token");
         state.adminToken = "";
         state.admin = null;
+        renderUser();
         renderAdmin();
       });
     }

@@ -4,7 +4,7 @@ Cloudflare Workers 上的轻量域名邮箱面板，保留 `nvidia-register` 需
 
 ## 已支持
 
-- 网页面板：访问 Worker 根路径 `/` 即可登录、注册、激活次数、创建邮箱、查看邮件。
+- 网页面板：访问 Worker 根路径 `/` 即可统一登录；管理员账号进入后台，用户账号进入邮箱面板。
 - 无限前缀：只要域名配置了 Email Routing catch-all，`001@域名`、`002@域名`、`jsbxbx@域名` 都能收。
 - 次数售卖：管理员生成 50/100 次激活码，用户注册时填激活码，账号创建后直接得到次数；每创建 1 个邮箱消耗 1 次。
 - 批量创建：随机批量生成，或用 `nv + 001/002/003` 这类编号批量创建。
@@ -31,7 +31,8 @@ Cloudflare Workers 上的轻量域名邮箱面板，保留 `nvidia-register` 需
 | 功能 | 方法 | 路径 |
 | --- | --- | --- |
 | 注册 | `POST` | `/app/api/register` |
-| 登录 | `POST` | `/app/api/login` |
+| 统一登录 | `POST` | `/auth/login` |
+| 用户登录（兼容） | `POST` | `/app/api/login` |
 | 当前用户 | `GET` | `/app/api/me` |
 | 兑换/激活更多次数 | `POST` | `/app/api/redeem` |
 | 地址列表 | `GET` | `/app/api/addresses` |
@@ -42,7 +43,7 @@ Cloudflare Workers 上的轻量域名邮箱面板，保留 `nvidia-register` 需
 | 批量创建地址 | `POST` | `/app/api/addresses/batch` |
 | 用户邮件列表 | `GET` | `/app/api/mails?address=xxx@domain` |
 | 用户邮件详情 | `GET` | `/app/api/mail/{id}` |
-| 管理员登录 | `POST` | `/admin/login` |
+| 管理员登录（兼容） | `POST` | `/admin/login` |
 | 当前管理员 | `GET` | `/admin/me` |
 | 管理员生成激活码 | `POST` | `/admin/redeem_codes` |
 
@@ -99,7 +100,7 @@ Worker 首次 API 请求会自动建表和迁移 `addresses.user_id`。如果你
 ## 给别人使用的流程
 
 1. 你在网页后台绑定 D1、R2、变量并部署。
-2. 你打开 Worker 根路径 `/`，用 `ADMIN_USERNAME` / `ADMIN_PASSWORD` 登录管理员。
+2. 你打开 Worker 根路径 `/`，在同一个登录框用 `ADMIN_USERNAME` / `ADMIN_PASSWORD` 进入管理员后台。
 3. 生成一个 50 次或 100 次激活码。
 4. 买家注册账号时填写激活码，注册成功后直接得到次数。
 5. 买家在“脚本 API 密钥”里生成自己的用户 API Key。
