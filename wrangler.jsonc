@@ -1,6 +1,6 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "cf-mail-compat",
+  "name": "small-mailbox",
   "main": "src/index.js",
   "compatibility_date": "2026-07-01",
   "keep_vars": true,
