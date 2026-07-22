@@ -73,6 +73,19 @@ export default {
         return await handleCreateRedeemCode(request, env);
       }
 
+      if (request.method === "GET" && path === "/admin/addresses") {
+        return await handleAdminAddressList(request, env, url);
+      }
+
+      if (request.method === "GET" && path === "/admin/mails") {
+        return await handleAdminMailList(request, env, url);
+      }
+
+      if (request.method === "GET" && path.startsWith("/admin/mail/")) {
+        const id = decodeURIComponent(path.slice("/admin/mail/".length));
+        return await handleAdminMailDetail(request, env, id);
+      }
+
       if (request.method === "POST" && path === "/app/api/register") {
         return await handleRegister(request, env);
       }
@@ -305,6 +318,52 @@ async function handleCreateRedeemCode(request, env) {
     used_count: 0,
     expires_at: expiresAt,
   }, 201);
+}
+
+async function handleAdminAddressList(request, env, url) {
+  await requireAdmin(request, env);
+
+  const limit = clampInt(url.searchParams.get("limit"), 100, 1, 200);
+  const offset = clampInt(url.searchParams.get("offset"), 0, 0, 100000);
+  const result = await env.MAIL_DB.prepare(
+    `SELECT
+       a.address,
+       a.name,
+       a.domain,
+       a.user_id,
+       u.username,
+       a.created_at,
+       COUNT(m.id) AS mail_count,
+       MAX(m.created_at) AS last_mail_at
+     FROM addresses a
+     LEFT JOIN users u ON u.id = a.user_id
+     LEFT JOIN mails m ON m.address = a.address
+     GROUP BY a.address, a.name, a.domain, a.user_id, u.username, a.created_at
+     ORDER BY COALESCE(MAX(m.created_at), a.created_at) DESC, a.address ASC
+     LIMIT ? OFFSET ?`
+  ).bind(limit, offset).all();
+
+  const rows = result.results || [];
+  return json({ results: rows, data: rows });
+}
+
+async function handleAdminMailList(request, env, url) {
+  await requireAdmin(request, env);
+
+  const address = normalizeEmail(url.searchParams.get("address") || "");
+  const limit = clampInt(url.searchParams.get("limit"), 50, 1, 100);
+  const offset = clampInt(url.searchParams.get("offset"), 0, 0, 100000);
+
+  const rows = address
+    ? await listMailsForAddress(env, address, limit, offset)
+    : await listAllMails(env, limit, offset);
+
+  return json({ results: rows, data: rows });
+}
+
+async function handleAdminMailDetail(request, env, id) {
+  await requireAdmin(request, env);
+  return getMailDetailById(env, id);
 }
 
 async function handleRegister(request, env) {
@@ -559,20 +618,17 @@ async function handleCreateAppAddressBatch(request, env) {
 async function handleAppMailList(request, env, url) {
   const user = await requireUser(request, env);
   const address = normalizeEmail(url.searchParams.get("address") || "");
+  const limit = clampInt(url.searchParams.get("limit"), 50, 1, 100);
+  const offset = clampInt(url.searchParams.get("offset"), 0, 0, 10000);
+
+  if (!address) {
+    const rows = await listUserMails(env, user.id, limit, offset);
+    return json({ results: rows, data: rows });
+  }
 
   await requireOwnedAddress(env, user.id, address);
 
-  const limit = clampInt(url.searchParams.get("limit"), 20, 1, 50);
-  const offset = clampInt(url.searchParams.get("offset"), 0, 0, 10000);
-  const result = await env.MAIL_DB.prepare(
-    `SELECT id, sender, recipient, subject, raw_size, message_id, created_at
-     FROM mails
-     WHERE address = ?
-     ORDER BY created_at DESC, id DESC
-     LIMIT ? OFFSET ?`
-  ).bind(address, limit, offset).all();
-
-  const rows = (result.results || []).map(mailListRow);
+  const rows = await listMailsForAddress(env, address, limit, offset);
   return json({ results: rows, data: rows });
 }
 
@@ -584,7 +640,7 @@ async function handleAppMailDetail(request, env, id) {
   }
 
   const mail = await env.MAIL_DB.prepare(
-    `SELECT m.id, m.sender, m.recipient, m.subject, m.raw_key, m.raw_size, m.message_id, m.created_at
+    `SELECT m.id, m.address, m.sender, m.recipient, m.subject, m.raw_key, m.raw_size, m.message_id, m.created_at
      FROM mails m
      JOIN addresses a ON a.address = m.address
      WHERE m.id = ? AND a.user_id = ?
@@ -607,23 +663,32 @@ async function handleAppMailDetail(request, env, id) {
 }
 
 async function handleMailList(request, env, url) {
+  const admin = await getAdminFromRequest(request, env);
+  if (admin) {
+    const address = normalizeEmail(url.searchParams.get("address") || "");
+    const limit = clampInt(url.searchParams.get("limit"), 50, 1, 100);
+    const offset = clampInt(url.searchParams.get("offset"), 0, 0, 100000);
+    const rows = address
+      ? await listMailsForAddress(env, address, limit, offset)
+      : await listAllMails(env, limit, offset);
+
+    return json({ results: rows, data: rows });
+  }
+
   const auth = await requireAddressJwt(request, env);
   const limit = clampInt(url.searchParams.get("limit"), 5, 1, 50);
   const offset = clampInt(url.searchParams.get("offset"), 0, 0, 10000);
 
-  const result = await env.MAIL_DB.prepare(
-    `SELECT id, sender, recipient, subject, raw_size, message_id, created_at
-     FROM mails
-     WHERE address = ?
-     ORDER BY created_at DESC, id DESC
-     LIMIT ? OFFSET ?`
-  ).bind(auth.address, limit, offset).all();
-
-  const rows = (result.results || []).map(mailListRow);
+  const rows = await listMailsForAddress(env, auth.address, limit, offset);
   return json({ results: rows, data: rows });
 }
 
 async function handleMailDetail(request, env, id) {
+  const admin = await getAdminFromRequest(request, env);
+  if (admin) {
+    return getMailDetailById(env, id);
+  }
+
   const auth = await requireAddressJwt(request, env);
 
   if (!isValidMailId(id)) {
@@ -649,6 +714,69 @@ async function handleMailDetail(request, env, id) {
   return json({
     id: mail.id,
     _id: mail.id,
+    raw,
+  });
+}
+
+async function listUserMails(env, userId, limit, offset) {
+  const result = await env.MAIL_DB.prepare(
+    `SELECT m.id, m.address, m.sender, m.recipient, m.subject, m.raw_size, m.message_id, m.created_at
+     FROM mails m
+     JOIN addresses a ON a.address = m.address
+     WHERE a.user_id = ?
+     ORDER BY m.created_at DESC, m.id DESC
+     LIMIT ? OFFSET ?`
+  ).bind(userId, limit, offset).all();
+
+  return (result.results || []).map(mailListRow);
+}
+
+async function listAllMails(env, limit, offset) {
+  const result = await env.MAIL_DB.prepare(
+    `SELECT id, address, sender, recipient, subject, raw_size, message_id, created_at
+     FROM mails
+     ORDER BY created_at DESC, id DESC
+     LIMIT ? OFFSET ?`
+  ).bind(limit, offset).all();
+
+  return (result.results || []).map(mailListRow);
+}
+
+async function listMailsForAddress(env, address, limit, offset) {
+  const result = await env.MAIL_DB.prepare(
+    `SELECT id, address, sender, recipient, subject, raw_size, message_id, created_at
+     FROM mails
+     WHERE address = ?
+     ORDER BY created_at DESC, id DESC
+     LIMIT ? OFFSET ?`
+  ).bind(address, limit, offset).all();
+
+  return (result.results || []).map(mailListRow);
+}
+
+async function getMailDetailById(env, id) {
+  if (!isValidMailId(id)) {
+    return errorJson("mail_not_found", 404);
+  }
+
+  const mail = await env.MAIL_DB.prepare(
+    `SELECT id, address, sender, recipient, subject, raw_key, raw_size, message_id, created_at
+     FROM mails
+     WHERE id = ?
+     LIMIT 1`
+  ).bind(id).first();
+
+  if (!mail) {
+    return errorJson("mail_not_found", 404);
+  }
+
+  const raw = await getRawMail(env, mail.raw_key);
+  if (!raw) {
+    return errorJson("mail_raw_not_found", 404);
+  }
+
+  return json({
+    ...mailListRow(mail),
     raw,
   });
 }
@@ -1057,11 +1185,12 @@ async function requireAddressCreator(request, env) {
 
 async function getAdminFromRequest(request, env) {
   const adminAuth = request.headers.get("x-admin-auth") || "";
-  if (env.EMAIL_AUTH && safeEqual(adminAuth, env.EMAIL_AUTH)) {
+  const token = getOptionalBearerToken(request);
+
+  if (env.EMAIL_AUTH && (safeEqual(adminAuth, env.EMAIL_AUTH) || safeEqual(token, env.EMAIL_AUTH))) {
     return { username: getAdminUsername(env), legacy: true };
   }
 
-  const token = getOptionalBearerToken(request);
   if (!token) {
     return null;
   }
@@ -1370,6 +1499,7 @@ function mailListRow(mail) {
   return {
     id: mail.id,
     _id: mail.id,
+    address: mail.address || mail.recipient || "",
     from: mail.sender,
     to: mail.recipient,
     subject: mail.subject || "",
@@ -3652,24 +3782,64 @@ function getAppHtml(env) {
               <strong id="adminName">-</strong>
             </div>
             <div class="stat">
-              <span>用途</span>
-              <strong>发码</strong>
+              <span>全局邮箱</span>
+              <strong id="adminAddressCount">0 个</strong>
+            </div>
+            <div class="stat">
+              <span>权限</span>
+              <strong>全局收信</strong>
             </div>
           </div>
-          <div class="sub-card">
-            <p class="sub-title">生成激活码</p>
-            <form class="form" id="adminCodeForm">
-              <div class="grid-2">
-                <label>次数
-                  <input name="credits" type="number" min="1" value="50">
-                </label>
-                <label>可用人数
-                  <input name="maxUses" type="number" min="1" value="1">
-                </label>
+
+          <div class="tools-grid">
+            <div class="sub-card">
+              <p class="sub-title">生成激活码</p>
+              <form class="form" id="adminCodeForm">
+                <div class="grid-2">
+                  <label>次数
+                    <input name="credits" type="number" min="1" value="50">
+                  </label>
+                  <label>可用人数
+                    <input name="maxUses" type="number" min="1" value="1">
+                  </label>
+                </div>
+                <button class="button" type="submit">生成激活码</button>
+              </form>
+              <div class="result-box hidden" id="adminResult"></div>
+            </div>
+
+            <div class="sub-card">
+              <p class="sub-title">管理员 API</p>
+              <p class="hint"><code>EMAIL_AUTH</code> 可作为 <code>Bearer</code> 或 <code>x-admin-auth</code>，访问 <code>/api/mails</code> 时默认返回全部邮件。</p>
+            </div>
+          </div>
+
+          <div class="mail-layout">
+            <aside class="address-pane">
+              <div class="pane-toolbar">
+                <strong>全局邮箱</strong>
+                <button class="button secondary small" id="adminRefreshButton" type="button">刷新</button>
               </div>
-              <button class="button" type="submit">生成激活码</button>
-            </form>
-            <div class="result-box hidden" id="adminResult"></div>
+              <div class="list" id="adminAddressList">
+                <div class="empty">加载全局邮箱中。</div>
+              </div>
+            </aside>
+
+            <section class="mail-pane">
+              <div class="mail-list" id="adminMailList">
+                <div class="empty">全部邮箱的邮件会显示在这里。</div>
+              </div>
+              <div class="mail-detail">
+                <div class="code-box" id="adminCodeBox">
+                  <div>
+                    <span>识别到验证码</span>
+                    <strong id="adminCodeText"></strong>
+                  </div>
+                  <button class="button secondary small" id="adminCopyCodeButton" type="button">复制</button>
+                </div>
+                <pre id="adminMailRaw">邮件原文会显示在这里。</pre>
+              </div>
+            </section>
           </div>
         </div>
       </section>
@@ -3804,6 +3974,7 @@ function getAppHtml(env) {
 
   <script>
     window.APP_CONFIG = ${appConfig};
+    const ALL_ADDRESSES = "__all__";
 
     const state = {
       token: localStorage.getItem("small_mailbox_token") || "",
@@ -3813,9 +3984,13 @@ function getAppHtml(env) {
       domains: window.APP_CONFIG.domains || [],
       apiKeys: [],
       addresses: [],
-      selectedAddress: "",
+      selectedAddress: ALL_ADDRESSES,
       mails: [],
       selectedMail: null,
+      adminAddresses: [],
+      adminSelectedAddress: ALL_ADDRESSES,
+      adminMails: [],
+      adminSelectedMail: null,
       authMode: "login"
     };
 
@@ -3832,6 +4007,14 @@ function getAppHtml(env) {
       adminCodeForm: document.getElementById("adminCodeForm"),
       adminLogoutButton: document.getElementById("adminLogoutButton"),
       adminName: document.getElementById("adminName"),
+      adminAddressCount: document.getElementById("adminAddressCount"),
+      adminRefreshButton: document.getElementById("adminRefreshButton"),
+      adminAddressList: document.getElementById("adminAddressList"),
+      adminMailList: document.getElementById("adminMailList"),
+      adminMailRaw: document.getElementById("adminMailRaw"),
+      adminCodeBox: document.getElementById("adminCodeBox"),
+      adminCodeText: document.getElementById("adminCodeText"),
+      adminCopyCodeButton: document.getElementById("adminCopyCodeButton"),
       adminResult: document.getElementById("adminResult"),
       profileName: document.getElementById("profileName"),
       profileCredits: document.getElementById("profileCredits"),
@@ -3958,6 +4141,9 @@ function getAppHtml(env) {
       const loggedIn = Boolean(state.admin);
       nodes.adminAppPanel.classList.toggle("hidden", !loggedIn);
       nodes.adminName.textContent = loggedIn ? state.admin.username : "-";
+      nodes.adminAddressCount.textContent = state.adminAddresses.length + " 个";
+      renderAdminAddresses();
+      renderAdminMails();
     }
 
     function renderAddresses() {
@@ -3974,13 +4160,23 @@ function getAppHtml(env) {
         return;
       }
 
-      nodes.addressList.innerHTML = state.addresses.map(function (address) {
+      const totalMails = state.addresses.reduce(function (sum, address) {
+        return sum + Number(address.mail_count || 0);
+      }, 0);
+      const allActive = state.selectedAddress === ALL_ADDRESSES ? " active" : "";
+      const allItem = '<button class="item' + allActive + '" data-address="' + ALL_ADDRESSES + '" type="button">' +
+        '<strong>全部邮件</strong>' +
+        '<span>' + totalMails + ' 封邮件 · 所有邮箱一起看</span>' +
+        '</button>';
+      const addressItems = state.addresses.map(function (address) {
         const active = address.address === state.selectedAddress ? " active" : "";
         return '<button class="item' + active + '" data-address="' + escapeHtml(address.address) + '" type="button">' +
           '<strong>' + escapeHtml(address.address) + '</strong>' +
           '<span>' + Number(address.mail_count || 0) + ' 封邮件 · ' + escapeHtml(address.last_mail_at || "暂无来信") + '</span>' +
           '</button>';
       }).join("");
+
+      nodes.addressList.innerHTML = allItem + addressItems;
     }
 
     function renderApiKeys() {
@@ -4019,7 +4215,8 @@ function getAppHtml(env) {
       }
 
       if (!state.mails.length) {
-        nodes.mailList.innerHTML = '<div class="empty">' + escapeHtml(state.selectedAddress) + ' 暂时没有邮件。</div>';
+        const label = state.selectedAddress === ALL_ADDRESSES ? "全部邮箱" : state.selectedAddress;
+        nodes.mailList.innerHTML = '<div class="empty">' + escapeHtml(label) + ' 暂时没有邮件。</div>';
         nodes.mailRaw.textContent = "等待来信后，点击邮件即可查看 raw 原文。";
         nodes.codeBox.classList.remove("visible");
         return;
@@ -4029,9 +4226,78 @@ function getAppHtml(env) {
         const active = state.selectedMail && state.selectedMail.id === mail.id ? " active" : "";
         return '<button class="item' + active + '" data-mail-id="' + escapeHtml(mail.id) + '" type="button">' +
           '<strong>' + escapeHtml(mail.subject || "(无主题)") + '</strong>' +
-          '<span>' + escapeHtml(mail.from || "") + ' · ' + escapeHtml(mail.created_at || "") + '</span>' +
+          '<span>' + escapeHtml(mail.from || "") + ' → ' + escapeHtml(mail.to || mail.address || "") + ' · ' + escapeHtml(mail.created_at || "") + '</span>' +
           '</button>';
       }).join("");
+    }
+
+    function renderAdminAddresses() {
+      if (!state.admin) {
+        nodes.adminAddressList.innerHTML = '<div class="empty">管理员登录后显示全局邮箱。</div>';
+        return;
+      }
+
+      if (!state.adminAddresses.length) {
+        nodes.adminAddressList.innerHTML = '<div class="empty">还没有任何邮箱。收到邮件后会自动出现。</div>';
+        return;
+      }
+
+      const totalMails = state.adminAddresses.reduce(function (sum, address) {
+        return sum + Number(address.mail_count || 0);
+      }, 0);
+      const allActive = state.adminSelectedAddress === ALL_ADDRESSES ? " active" : "";
+      const allItem = '<button class="item' + allActive + '" data-admin-address="' + ALL_ADDRESSES + '" type="button">' +
+        '<strong>全部邮件</strong>' +
+        '<span>' + totalMails + ' 封邮件 · 所有邮箱一起看</span>' +
+        '</button>';
+      const addressItems = state.adminAddresses.map(function (address) {
+        const active = address.address === state.adminSelectedAddress ? " active" : "";
+        const owner = address.username ? "用户 " + address.username : "未分配";
+        return '<button class="item' + active + '" data-admin-address="' + escapeHtml(address.address) + '" type="button">' +
+          '<strong>' + escapeHtml(address.address) + '</strong>' +
+          '<span>' + Number(address.mail_count || 0) + ' 封邮件 · ' + escapeHtml(owner) + ' · ' + escapeHtml(address.last_mail_at || "暂无来信") + '</span>' +
+          '</button>';
+      }).join("");
+
+      nodes.adminAddressList.innerHTML = allItem + addressItems;
+    }
+
+    function renderAdminMails() {
+      if (!state.admin) {
+        nodes.adminMailList.innerHTML = '<div class="empty">管理员登录后显示全部邮件。</div>';
+        nodes.adminMailRaw.textContent = "邮件原文会显示在这里。";
+        nodes.adminCodeBox.classList.remove("visible");
+        return;
+      }
+
+      if (!state.adminMails.length) {
+        const label = state.adminSelectedAddress === ALL_ADDRESSES ? "全部邮箱" : state.adminSelectedAddress;
+        nodes.adminMailList.innerHTML = '<div class="empty">' + escapeHtml(label) + ' 暂时没有邮件。</div>';
+        nodes.adminMailRaw.textContent = "等待来信后，点击邮件即可查看 raw 原文。";
+        nodes.adminCodeBox.classList.remove("visible");
+        return;
+      }
+
+      nodes.adminMailList.innerHTML = state.adminMails.map(function (mail) {
+        const active = state.adminSelectedMail && state.adminSelectedMail.id === mail.id ? " active" : "";
+        return '<button class="item' + active + '" data-admin-mail-id="' + escapeHtml(mail.id) + '" type="button">' +
+          '<strong>' + escapeHtml(mail.subject || "(无主题)") + '</strong>' +
+          '<span>' + escapeHtml(mail.from || "") + ' → ' + escapeHtml(mail.to || mail.address || "") + ' · ' + escapeHtml(mail.created_at || "") + '</span>' +
+          '</button>';
+      }).join("");
+    }
+
+    function renderAdminMailDetail(mail) {
+      if (!mail) {
+        nodes.adminMailRaw.textContent = "邮件原文会显示在这里。";
+        nodes.adminCodeBox.classList.remove("visible");
+        return;
+      }
+
+      nodes.adminMailRaw.textContent = mail.raw || "";
+      const code = extractVerificationCode(mail.raw || "");
+      nodes.adminCodeText.textContent = code;
+      nodes.adminCodeBox.classList.toggle("visible", Boolean(code));
     }
 
     function renderMailDetail(mail) {
@@ -4068,23 +4334,20 @@ function getAppHtml(env) {
       state.admin = data.admin;
       renderUser();
       renderAdmin();
+      await loadAdminData();
     }
 
     async function loadAddresses() {
       const data = await userApi("/app/api/addresses");
       state.addresses = data.results || data.data || [];
-      if (!state.selectedAddress && state.addresses.length) {
-        state.selectedAddress = state.addresses[0].address;
+      if (!state.selectedAddress) {
+        state.selectedAddress = ALL_ADDRESSES;
       }
-      if (state.selectedAddress && !state.addresses.some(function (item) { return item.address === state.selectedAddress; })) {
-        state.selectedAddress = state.addresses.length ? state.addresses[0].address : "";
+      if (state.selectedAddress !== ALL_ADDRESSES && !state.addresses.some(function (item) { return item.address === state.selectedAddress; })) {
+        state.selectedAddress = ALL_ADDRESSES;
       }
       renderAddresses();
-      if (state.selectedAddress) {
-        await loadMails(state.selectedAddress);
-      } else {
-        renderMails();
-      }
+      await loadMails(state.selectedAddress);
     }
 
     async function loadApiKeys() {
@@ -4094,8 +4357,12 @@ function getAppHtml(env) {
     }
 
     async function loadMails(address) {
-      state.selectedAddress = address;
-      const data = await userApi("/app/api/mails?limit=20&offset=0&address=" + encodeURIComponent(address));
+      const isAll = !address || address === ALL_ADDRESSES;
+      state.selectedAddress = isAll ? ALL_ADDRESSES : address;
+      const endpoint = isAll
+        ? "/app/api/mails?limit=50&offset=0"
+        : "/app/api/mails?limit=50&offset=0&address=" + encodeURIComponent(address);
+      const data = await userApi(endpoint);
       state.mails = data.results || data.data || [];
       state.selectedMail = null;
       renderAddresses();
@@ -4108,6 +4375,44 @@ function getAppHtml(env) {
       state.selectedMail = data;
       renderMails();
       renderMailDetail(data);
+    }
+
+    async function loadAdminData() {
+      await loadAdminAddresses();
+      await loadAdminMails(state.adminSelectedAddress);
+    }
+
+    async function loadAdminAddresses() {
+      const data = await adminApi("/admin/addresses?limit=200&offset=0");
+      state.adminAddresses = data.results || data.data || [];
+      if (!state.adminSelectedAddress) {
+        state.adminSelectedAddress = ALL_ADDRESSES;
+      }
+      if (state.adminSelectedAddress !== ALL_ADDRESSES && !state.adminAddresses.some(function (item) { return item.address === state.adminSelectedAddress; })) {
+        state.adminSelectedAddress = ALL_ADDRESSES;
+      }
+      renderAdmin();
+    }
+
+    async function loadAdminMails(address) {
+      const isAll = !address || address === ALL_ADDRESSES;
+      state.adminSelectedAddress = isAll ? ALL_ADDRESSES : address;
+      const endpoint = isAll
+        ? "/admin/mails?limit=50&offset=0"
+        : "/admin/mails?limit=50&offset=0&address=" + encodeURIComponent(address);
+      const data = await adminApi(endpoint);
+      state.adminMails = data.results || data.data || [];
+      state.adminSelectedMail = null;
+      renderAdminAddresses();
+      renderAdminMails();
+      renderAdminMailDetail(null);
+    }
+
+    async function openAdminMail(id) {
+      const data = await adminApi("/admin/mail/" + encodeURIComponent(id));
+      state.adminSelectedMail = data;
+      renderAdminMails();
+      renderAdminMailDetail(data);
     }
 
     async function copyText(value) {
@@ -4130,8 +4435,12 @@ function getAppHtml(env) {
           state.apiKeys = [];
           state.addresses = [];
           state.mails = [];
-          state.selectedAddress = "";
+          state.selectedAddress = ALL_ADDRESSES;
           state.selectedMail = null;
+          state.adminAddresses = [];
+          state.adminSelectedAddress = ALL_ADDRESSES;
+          state.adminMails = [];
+          state.adminSelectedMail = null;
           localStorage.setItem("small_mailbox_admin_token", state.adminToken);
           localStorage.removeItem("small_mailbox_token");
           form.reset();
@@ -4140,6 +4449,7 @@ function getAppHtml(env) {
           renderAddresses();
           renderApiKeys();
           renderMails();
+          await loadAdminData();
           toast("管理员已登录");
           return;
         }
@@ -4148,6 +4458,10 @@ function getAppHtml(env) {
         state.user = data.user;
         state.adminToken = "";
         state.admin = null;
+        state.adminAddresses = [];
+        state.adminSelectedAddress = ALL_ADDRESSES;
+        state.adminMails = [];
+        state.adminSelectedMail = null;
         localStorage.setItem("small_mailbox_token", state.token);
         localStorage.removeItem("small_mailbox_admin_token");
         form.reset();
@@ -4187,8 +4501,12 @@ function getAppHtml(env) {
       state.apiKeys = [];
       state.addresses = [];
       state.mails = [];
-      state.selectedAddress = "";
+      state.selectedAddress = ALL_ADDRESSES;
       state.selectedMail = null;
+      state.adminAddresses = [];
+      state.adminSelectedAddress = ALL_ADDRESSES;
+      state.adminMails = [];
+      state.adminSelectedMail = null;
       renderUser();
       renderAdmin();
       renderAddresses();
@@ -4201,6 +4519,10 @@ function getAppHtml(env) {
       localStorage.removeItem("small_mailbox_admin_token");
       state.adminToken = "";
       state.admin = null;
+      state.adminAddresses = [];
+      state.adminSelectedAddress = ALL_ADDRESSES;
+      state.adminMails = [];
+      state.adminSelectedMail = null;
       nodes.adminResult.classList.add("hidden");
       nodes.adminResult.textContent = "";
       renderUser();
@@ -4228,6 +4550,10 @@ function getAppHtml(env) {
           localStorage.removeItem("small_mailbox_admin_token");
           state.adminToken = "";
           state.admin = null;
+          state.adminAddresses = [];
+          state.adminSelectedAddress = ALL_ADDRESSES;
+          state.adminMails = [];
+          state.adminSelectedMail = null;
           renderUser();
           renderAdmin();
         }
@@ -4356,11 +4682,30 @@ function getAppHtml(env) {
       }
     });
 
+    nodes.adminRefreshButton.addEventListener("click", async function () {
+      try {
+        await loadAdminData();
+        toast("已刷新全局收件箱");
+      } catch (error) {
+        toast(error.message);
+      }
+    });
+
     nodes.addressList.addEventListener("click", async function (event) {
       const button = event.target.closest("[data-address]");
       if (!button) return;
       try {
         await loadMails(button.dataset.address);
+      } catch (error) {
+        toast(error.message);
+      }
+    });
+
+    nodes.adminAddressList.addEventListener("click", async function (event) {
+      const button = event.target.closest("[data-admin-address]");
+      if (!button) return;
+      try {
+        await loadAdminMails(button.dataset.adminAddress);
       } catch (error) {
         toast(error.message);
       }
@@ -4376,9 +4721,25 @@ function getAppHtml(env) {
       }
     });
 
+    nodes.adminMailList.addEventListener("click", async function (event) {
+      const button = event.target.closest("[data-admin-mail-id]");
+      if (!button) return;
+      try {
+        await openAdminMail(button.dataset.adminMailId);
+      } catch (error) {
+        toast(error.message);
+      }
+    });
+
     nodes.copyCodeButton.addEventListener("click", function () {
       if (nodes.codeText.textContent) {
         copyText(nodes.codeText.textContent);
+      }
+    });
+
+    nodes.adminCopyCodeButton.addEventListener("click", function () {
+      if (nodes.adminCodeText.textContent) {
+        copyText(nodes.adminCodeText.textContent);
       }
     });
 
@@ -4404,6 +4765,10 @@ function getAppHtml(env) {
         localStorage.removeItem("small_mailbox_admin_token");
         state.adminToken = "";
         state.admin = null;
+        state.adminAddresses = [];
+        state.adminSelectedAddress = ALL_ADDRESSES;
+        state.adminMails = [];
+        state.adminSelectedMail = null;
         renderUser();
         renderAdmin();
       });

@@ -26,6 +26,8 @@ Cloudflare Workers 上的轻量域名邮箱面板，保留 `nvidia-register` 需
 - 管理员密钥：也就是 Worker 环境变量里的 `EMAIL_AUTH`，创建地址不扣用户额度。
 - 用户 API Key：用户在网页里生成，创建地址会扣该用户 1 次额度，并自动归属到他的邮箱池。
 
+管理员密钥还可以作为 `Authorization: Bearer {EMAIL_AUTH}` 使用；访问 `/api/mails` 不带 `address` 时返回全局全部邮箱邮件，带 `address=xxx@domain` 时按邮箱筛选。
+
 ## 网页接口
 
 | 功能 | 方法 | 路径 |
@@ -46,6 +48,9 @@ Cloudflare Workers 上的轻量域名邮箱面板，保留 `nvidia-register` 需
 | 管理员登录（兼容） | `POST` | `/admin/login` |
 | 当前管理员 | `GET` | `/admin/me` |
 | 管理员生成激活码 | `POST` | `/admin/redeem_codes` |
+| 管理员全局地址 | `GET` | `/admin/addresses` |
+| 管理员全局邮件列表 | `GET` | `/admin/mails?address=xxx@domain` |
+| 管理员全局邮件详情 | `GET` | `/admin/mail/{id}` |
 
 `/app/api/*` 的用户接口可以用两种 Bearer：
 
@@ -56,6 +61,9 @@ Cloudflare Workers 上的轻量域名邮箱面板，保留 `nvidia-register` 需
 
 ```bash
 curl "https://你的-worker-域名/app/api/addresses" ^
+  -H "Authorization: Bearer smk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+curl "https://你的-worker-域名/app/api/mails?limit=20&offset=0" ^
   -H "Authorization: Bearer smk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
 curl "https://你的-worker-域名/app/api/mails?address=001@tyrlink.dpdns.org&limit=20&offset=0" ^
