@@ -4599,41 +4599,43 @@ function getAppHtml(env) {
     }
 
     function sanitizeEmailHtml(html) {
-      return String(html || "")
-        .replace(/<script\b[\s\S]*?<\/script>/gi, "")
-        .replace(/<iframe\b[\s\S]*?<\/iframe>/gi, "")
-        .replace(/<object\b[\s\S]*?<\/object>/gi, "")
-        .replace(/<embed\b[\s\S]*?>/gi, "")
-        .replace(/<form\b[\s\S]*?<\/form>/gi, "")
-        .replace(/<meta\b[^>]*http-equiv=["']?refresh["']?[^>]*>/gi, "")
-        .replace(/\son[a-z]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, "")
-        .replace(/javascript:/gi, "");
+      const template = document.createElement("template");
+      template.innerHTML = String(html || "");
+      template.content.querySelectorAll('script, iframe, object, embed, form, meta[http-equiv="refresh"]').forEach(function (node) {
+        node.remove();
+      });
+      template.content.querySelectorAll("*").forEach(function (node) {
+        Array.from(node.attributes || []).forEach(function (attribute) {
+          const name = attribute.name.toLowerCase();
+          const value = String(attribute.value || "").trim().toLowerCase();
+          if (name.startsWith("on") || value.startsWith("javascript:")) {
+            node.removeAttribute(attribute.name);
+          }
+        });
+      });
+      return template.innerHTML;
     }
 
     function extractEmailStyles(html) {
-      return (String(html || "").match(/<style\b[^>]*>[\s\S]*?<\/style>/gi) || []).join("");
+      const template = document.createElement("template");
+      template.innerHTML = String(html || "");
+      return Array.from(template.content.querySelectorAll("style")).map(function (node) {
+        return node.outerHTML;
+      }).join("");
     }
 
     function extractEmailBody(html) {
-      const match = String(html || "").match(/<body\b[^>]*>([\s\S]*?)<\/body>/i);
-      return match ? match[1] : html;
+      const parsed = new DOMParser().parseFromString(String(html || ""), "text/html");
+      return parsed.body ? parsed.body.innerHTML : String(html || "");
     }
 
     function textFromHtml(html) {
-      const text = String(html || "")
-        .replace(/<style\b[\s\S]*?<\/style>/gi, " ")
-        .replace(/<script\b[\s\S]*?<\/script>/gi, " ")
-        .replace(/<[^>]+>/g, " ")
-        .replace(/&nbsp;/gi, " ")
-        .replace(/&amp;/gi, "&")
-        .replace(/&lt;/gi, "<")
-        .replace(/&gt;/gi, ">")
-        .replace(/&#(\d+);/g, function (_, code) {
-          return String.fromCharCode(Number(code));
-        })
-        .replace(/\s+/g, " ")
-        .trim();
-      return text;
+      const template = document.createElement("template");
+      template.innerHTML = String(html || "");
+      template.content.querySelectorAll("style, script").forEach(function (node) {
+        node.remove();
+      });
+      return (template.content.textContent || "").replace(/\s+/g, " ").trim();
     }
 
     function ensurePreviewVisible(frame, mail) {
