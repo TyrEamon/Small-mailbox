@@ -14,6 +14,7 @@ const CORS_HEADERS = {
   "access-control-allow-headers": "authorization,content-type,x-admin-auth",
 };
 
+const ADMIN_SESSION_TTL_SECONDS = 12 * 60 * 60;
 const USER_SESSION_TTL_SECONDS = 7 * 24 * 60 * 60;
 const PASSWORD_ITERATIONS = 100000;
 const DEFAULT_MAX_BATCH_CREATE = 100;
@@ -51,6 +52,14 @@ export default {
 
       ensureBindings(env);
       await ensureSchema(env);
+
+      if (request.method === "POST" && path === "/admin/login") {
+        return handleAdminLogin(request, env);
+      }
+
+      if (request.method === "GET" && path === "/admin/me") {
+        return handleAdminMe(request, env);
+      }
 
       if (request.method === "POST" && path === "/admin/new_address") {
         return handleNewAddress(request, env);
@@ -185,6 +194,38 @@ export default {
   },
 };
 
+async function handleAdminLogin(request, env) {
+  const body = await readJsonBody(request);
+  const username = String(body.username || "").trim();
+  const password = String(body.password || "");
+
+  if (!safeEqual(username, getAdminUsername(env)) || !safeEqual(password, getAdminPassword(env))) {
+    return errorJson("invalid_admin_login", 401);
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const token = await signJwt(env, {
+    type: "admin",
+    username,
+    iat: now,
+    exp: now + ADMIN_SESSION_TTL_SECONDS,
+  });
+
+  return json({
+    token,
+    admin: {
+      username,
+    },
+  });
+}
+
+async function handleAdminMe(request, env) {
+  const admin = await requireAdmin(request, env);
+  return json({
+    admin,
+  });
+}
+
 async function handleNewAddress(request, env) {
   const actor = await requireAddressCreator(request, env);
 
@@ -251,6 +292,13 @@ async function handleRegister(request, env) {
   const body = await readJsonBody(request);
   const username = normalizeUsername(body.username);
   const password = normalizePassword(body.password);
+  const activationCode = String(body.code || body.activation_code || body.activationCode || "").trim();
+  const requiresCode = String(env.REQUIRE_REGISTER_CODE || "true").toLowerCase() !== "false";
+
+  if (requiresCode && !activationCode) {
+    return errorJson("activation_code_required", 400);
+  }
+
   const passwordRecord = await hashPassword(password);
 
   try {
@@ -263,9 +311,27 @@ async function handleRegister(request, env) {
   }
 
   const user = await getUserByUsername(env, username);
+  let creditsAdded = 0;
+
+  if (activationCode) {
+    try {
+      creditsAdded = await claimRedeemCodeForUser(env, user.id, activationCode);
+    } catch (error) {
+      await env.MAIL_DB.prepare(
+        `DELETE FROM users
+         WHERE id = ?`
+      ).bind(user.id).run();
+      throw error;
+    }
+  }
+
+  const updatedUser = await getUserById(env, user.id);
   const token = await signUserToken(env, user);
 
-  return json(sessionPayload(user, token), 201);
+  return json({
+    ...sessionPayload(updatedUser, token),
+    credits_added: creditsAdded,
+  }, 201);
 }
 
 async function handleLogin(request, env) {
@@ -297,6 +363,17 @@ async function handleRedeem(request, env) {
   const user = await requireUser(request, env);
   const body = await readJsonBody(request);
   const code = normalizeRedeemCode(body.code);
+  const creditsAdded = await claimRedeemCodeForUser(env, user.id, code);
+  const updatedUser = await getUserById(env, user.id);
+
+  return json({
+    user: publicUser(updatedUser),
+    credits_added: creditsAdded,
+  });
+}
+
+async function claimRedeemCodeForUser(env, userId, codeValue) {
+  const code = normalizeRedeemCode(codeValue);
   const redeemCode = await env.MAIL_DB.prepare(
     `SELECT code, credits, max_uses, used_count, expires_at
      FROM redeem_codes
@@ -305,24 +382,24 @@ async function handleRedeem(request, env) {
   ).bind(code).first();
 
   if (!redeemCode) {
-    return errorJson("redeem_code_not_found", 404);
+    throw httpError("redeem_code_not_found", 404);
   }
 
   if (redeemCode.expires_at && new Date(redeemCode.expires_at).getTime() < Date.now()) {
-    return errorJson("redeem_code_expired", 410);
+    throw httpError("redeem_code_expired", 410);
   }
 
   if (Number(redeemCode.used_count) >= Number(redeemCode.max_uses)) {
-    return errorJson("redeem_code_exhausted", 409);
+    throw httpError("redeem_code_exhausted", 409);
   }
 
   const useResult = await env.MAIL_DB.prepare(
     `INSERT OR IGNORE INTO redeem_uses (user_id, code)
      VALUES (?, ?)`
-  ).bind(user.id, code).run();
+  ).bind(userId, code).run();
 
   if (!hasChanges(useResult)) {
-    return errorJson("redeem_code_already_used", 409);
+    throw httpError("redeem_code_already_used", 409);
   }
 
   const claimResult = await env.MAIL_DB.prepare(
@@ -335,17 +412,12 @@ async function handleRedeem(request, env) {
     await env.MAIL_DB.prepare(
       `DELETE FROM redeem_uses
        WHERE user_id = ? AND code = ?`
-    ).bind(user.id, code).run();
-    return errorJson("redeem_code_exhausted", 409);
+    ).bind(userId, code).run();
+    throw httpError("redeem_code_exhausted", 409);
   }
 
-  await addCredits(env, user.id, redeemCode.credits);
-  const updatedUser = await getUserById(env, user.id);
-
-  return json({
-    user: publicUser(updatedUser),
-    credits_added: Number(redeemCode.credits),
-  });
+  await addCredits(env, userId, redeemCode.credits);
+  return Number(redeemCode.credits);
 }
 
 async function handleApiKeyList(request, env) {
@@ -944,18 +1016,20 @@ async function readJsonBody(request) {
 }
 
 async function requireAdmin(request, env) {
-  const adminAuth = request.headers.get("x-admin-auth") || "";
-  if (!env.EMAIL_AUTH || !safeEqual(adminAuth, env.EMAIL_AUTH)) {
+  const admin = await getAdminFromRequest(request, env);
+  if (!admin) {
     throw httpError("unauthorized", 401);
   }
+  return admin;
 }
 
 async function requireAddressCreator(request, env) {
-  const headerAuth = request.headers.get("x-admin-auth") || "";
-
-  if (env.EMAIL_AUTH && safeEqual(headerAuth, env.EMAIL_AUTH)) {
-    return { type: "admin" };
+  const admin = await getAdminFromRequest(request, env);
+  if (admin) {
+    return { type: "admin", admin };
   }
+
+  const headerAuth = request.headers.get("x-admin-auth") || "";
 
   const user = await getUserByApiKey(env, headerAuth);
   if (user) {
@@ -963,6 +1037,32 @@ async function requireAddressCreator(request, env) {
   }
 
   throw httpError("unauthorized", 401);
+}
+
+async function getAdminFromRequest(request, env) {
+  const adminAuth = request.headers.get("x-admin-auth") || "";
+  if (env.EMAIL_AUTH && safeEqual(adminAuth, env.EMAIL_AUTH)) {
+    return { username: getAdminUsername(env), legacy: true };
+  }
+
+  const token = getOptionalBearerToken(request);
+  if (!token) {
+    return null;
+  }
+
+  try {
+    const payload = await verifyJwt(env, token);
+    if (payload.type === "admin") {
+      return {
+        username: payload.username || getAdminUsername(env),
+        legacy: false,
+      };
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
 }
 
 async function requireAddressJwt(request, env) {
@@ -1010,11 +1110,21 @@ async function requireBearerPayload(request, env) {
 }
 
 function getBearerToken(request) {
+  const token = getOptionalBearerToken(request);
+
+  if (!token) {
+    throw httpError("unauthorized", 401);
+  }
+
+  return token;
+}
+
+function getOptionalBearerToken(request) {
   const authorization = request.headers.get("authorization") || "";
   const match = authorization.match(/^Bearer\s+(.+)$/i);
 
   if (!match) {
-    throw httpError("unauthorized", 401);
+    return "";
   }
 
   return match[1].trim();
@@ -1479,6 +1589,18 @@ function getJwtSecret(env) {
   return secret;
 }
 
+function getAdminUsername(env) {
+  return String(env.ADMIN_USERNAME || "admin").trim();
+}
+
+function getAdminPassword(env) {
+  const password = env.ADMIN_PASSWORD || env.EMAIL_AUTH;
+  if (!password) {
+    throw httpError("missing_admin_password", 500);
+  }
+  return String(password);
+}
+
 function clampInt(value, fallback, min, max) {
   const parsed = Number.parseInt(value, 10);
   if (!Number.isFinite(parsed)) {
@@ -1552,7 +1674,7 @@ function withCors(response) {
   });
 }
 
-function getAppHtml(env) {
+function getLegacyAppHtml(env) {
   const appConfig = JSON.stringify({
     domains: Array.from(getAllowedDomains(env)),
     defaultDomain: getDefaultDomain(env),
@@ -2681,6 +2803,1378 @@ function getAppHtml(env) {
         state.user = null;
         renderAccount();
         toast("登录已过期，请重新登录");
+      });
+    }
+  </script>
+</body>
+</html>`;
+}
+
+function getAppHtml(env) {
+  const appConfig = JSON.stringify({
+    domains: Array.from(getAllowedDomains(env)),
+    defaultDomain: getDefaultDomain(env),
+  }).replace(/</g, "\\u003c");
+
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Small Mailbox</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f3f5f8;
+      --card: #ffffff;
+      --card-soft: #f8fafc;
+      --line: #e3e8ef;
+      --line-strong: #d4dce7;
+      --text: #111827;
+      --muted: #8a95a7;
+      --primary: #4f6ef7;
+      --primary-strong: #3d5df2;
+      --success: #17b26a;
+      --danger: #ef4444;
+      --warning: #f59e0b;
+      --shadow: 0 6px 18px rgba(15, 23, 42, 0.08);
+      --radius: 12px;
+      font-family: "Microsoft YaHei UI", "Segoe UI", Aptos, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 14px;
+    }
+
+    button, input, select {
+      font: inherit;
+    }
+
+    button {
+      cursor: pointer;
+      border: 0;
+    }
+
+    .topbar {
+      height: 64px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 28px;
+      background: var(--card);
+      border-bottom: 1px solid var(--line);
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    .brand-mark {
+      width: 24px;
+      height: 16px;
+      border-radius: 10px;
+      background: var(--primary);
+      position: relative;
+    }
+
+    .brand-mark::before {
+      content: "";
+      position: absolute;
+      width: 12px;
+      height: 12px;
+      left: 4px;
+      top: -5px;
+      border-radius: 50%;
+      background: var(--primary);
+      box-shadow: 8px 2px 0 var(--primary);
+    }
+
+    .brand strong {
+      font-size: 20px;
+      letter-spacing: -0.02em;
+    }
+
+    .brand span {
+      color: var(--muted);
+      border-left: 1px solid var(--line-strong);
+      padding-left: 10px;
+      white-space: nowrap;
+    }
+
+    .top-actions {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      color: var(--muted);
+    }
+
+    .page {
+      width: min(1320px, calc(100% - 44px));
+      margin: 28px auto;
+      display: grid;
+      gap: 18px;
+    }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 14px;
+      padding: 20px 22px 14px;
+      border-bottom: 1px solid #edf1f6;
+    }
+
+    .card-title {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 17px;
+      font-weight: 800;
+    }
+
+    .card-title::before {
+      content: "";
+      width: 14px;
+      height: 14px;
+      border-radius: 4px;
+      background: var(--primary);
+      box-shadow: inset 0 -5px 0 rgba(255, 255, 255, 0.35);
+    }
+
+    .card-body {
+      padding: 20px 22px 22px;
+    }
+
+    .auth-grid {
+      display: grid;
+      grid-template-columns: minmax(280px, 420px) 1fr;
+      gap: 18px;
+      align-items: start;
+    }
+
+    .grid-2 {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .grid-3 {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .tabs {
+      display: inline-flex;
+      gap: 4px;
+      padding: 4px;
+      border-radius: 10px;
+      background: #eef2f8;
+    }
+
+    .tab {
+      min-width: 74px;
+      padding: 8px 12px;
+      color: var(--muted);
+      background: transparent;
+      border-radius: 8px;
+      font-weight: 700;
+    }
+
+    .tab.active {
+      color: var(--primary);
+      background: var(--card);
+      box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
+    }
+
+    .form {
+      display: grid;
+      gap: 12px;
+    }
+
+    label {
+      display: grid;
+      gap: 7px;
+      color: #5f6b7b;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    input, select {
+      width: 100%;
+      height: 40px;
+      border: 1px solid var(--line-strong);
+      border-radius: 9px;
+      background: #fff;
+      color: var(--text);
+      outline: none;
+      padding: 0 11px;
+      transition: border-color .15s ease, box-shadow .15s ease;
+    }
+
+    input:focus, select:focus {
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(79, 110, 247, 0.14);
+    }
+
+    .button {
+      min-height: 38px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      padding: 0 14px;
+      border-radius: 8px;
+      color: #fff;
+      background: var(--primary);
+      font-weight: 800;
+      white-space: nowrap;
+      transition: background .15s ease, transform .15s ease, opacity .15s ease;
+    }
+
+    .button:hover { background: var(--primary-strong); }
+    .button:active { transform: translateY(1px); }
+    .button:disabled { cursor: not-allowed; opacity: .55; }
+
+    .button.secondary {
+      color: var(--primary);
+      background: #eef3ff;
+    }
+
+    .button.secondary:hover { background: #e3ebff; }
+
+    .button.ghost {
+      color: var(--muted);
+      background: transparent;
+    }
+
+    .button.danger {
+      background: var(--danger);
+    }
+
+    .button.small {
+      min-height: 30px;
+      padding: 0 10px;
+      font-size: 12px;
+      border-radius: 7px;
+    }
+
+    .hint {
+      color: var(--muted);
+      line-height: 1.7;
+      margin: 0;
+    }
+
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .stat {
+      padding: 16px;
+      background: var(--card-soft);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+    }
+
+    .stat span {
+      display: block;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+
+    .stat strong {
+      font-size: 24px;
+      letter-spacing: -0.03em;
+    }
+
+    .section-stack {
+      display: grid;
+      gap: 18px;
+    }
+
+    .tools-grid {
+      display: grid;
+      grid-template-columns: 1.1fr .9fr;
+      gap: 18px;
+    }
+
+    .sub-card {
+      padding: 16px;
+      background: var(--card-soft);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      display: grid;
+      gap: 12px;
+    }
+
+    .sub-title {
+      font-size: 15px;
+      font-weight: 800;
+      margin: 0;
+    }
+
+    .mail-layout {
+      display: grid;
+      grid-template-columns: 330px minmax(0, 1fr);
+      border-top: 1px solid #edf1f6;
+    }
+
+    .address-pane {
+      border-right: 1px solid #edf1f6;
+      min-width: 0;
+    }
+
+    .pane-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 14px 16px;
+      border-bottom: 1px solid #edf1f6;
+    }
+
+    .list {
+      display: grid;
+      gap: 10px;
+      padding: 14px 16px;
+      max-height: 470px;
+      overflow: auto;
+    }
+
+    .item {
+      width: 100%;
+      text-align: left;
+      color: var(--text);
+      border: 1px solid var(--line);
+      background: #fff;
+      border-radius: 10px;
+      padding: 12px 14px;
+      transition: border-color .15s ease, background .15s ease;
+    }
+
+    .item:hover {
+      border-color: #b9c7ff;
+      background: #f8faff;
+    }
+
+    .item.active {
+      border-color: #9db0ff;
+      background: #edf3ff;
+    }
+
+    .item strong {
+      display: block;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      margin-bottom: 6px;
+    }
+
+    .item span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .item-actions {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-top: 10px;
+    }
+
+    .mail-pane {
+      min-width: 0;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+    }
+
+    .mail-list {
+      display: grid;
+      gap: 8px;
+      padding: 14px 16px;
+      border-bottom: 1px solid #edf1f6;
+      max-height: 240px;
+      overflow: auto;
+    }
+
+    .mail-detail {
+      min-height: 300px;
+      padding: 16px;
+      overflow: auto;
+    }
+
+    .code-box {
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+      padding: 14px 16px;
+      border: 1px solid #bcebd6;
+      border-radius: 10px;
+      background: #effbf5;
+    }
+
+    .code-box.visible { display: flex; }
+
+    .code-box span {
+      display: block;
+      color: #49715e;
+      font-size: 12px;
+      margin-bottom: 4px;
+    }
+
+    .code-box strong {
+      font-size: 24px;
+      color: #057a4f;
+      letter-spacing: .04em;
+    }
+
+    pre {
+      margin: 0;
+      min-height: 220px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fbfcfe;
+      color: #253142;
+      padding: 14px;
+      font-family: "Cascadia Mono", Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.7;
+    }
+
+    .result-box {
+      display: block;
+      max-height: 160px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: #536173;
+      background: #fbfcfe;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      padding: 10px;
+      font-size: 12px;
+      line-height: 1.7;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      padding: 0 9px;
+      border-radius: 999px;
+      color: #0f8a50;
+      background: #dcfce7;
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .empty {
+      padding: 16px;
+      color: var(--muted);
+      background: #fbfcfe;
+      border: 1px dashed var(--line-strong);
+      border-radius: 10px;
+      line-height: 1.7;
+    }
+
+    .hidden { display: none !important; }
+
+    .toast {
+      position: fixed;
+      right: 22px;
+      bottom: 22px;
+      max-width: 360px;
+      padding: 12px 14px;
+      border-radius: 10px;
+      color: #fff;
+      background: #111827;
+      box-shadow: 0 10px 28px rgba(15, 23, 42, 0.18);
+      opacity: 0;
+      pointer-events: none;
+      transform: translateY(8px);
+      transition: opacity .16s ease, transform .16s ease;
+    }
+
+    .toast.visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    @media (max-width: 980px) {
+      .auth-grid, .tools-grid, .mail-layout, .grid-2, .grid-3, .stats {
+        grid-template-columns: 1fr;
+      }
+
+      .address-pane {
+        border-right: 0;
+        border-bottom: 1px solid #edf1f6;
+      }
+    }
+
+    @media (max-width: 640px) {
+      .topbar {
+        padding: 0 14px;
+      }
+
+      .brand span {
+        display: none;
+      }
+
+      .page {
+        width: min(100% - 20px, 1320px);
+        margin: 14px auto;
+      }
+
+      .card-header, .card-body {
+        padding-left: 14px;
+        padding-right: 14px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark"></span>
+      <strong>Small Mailbox</strong>
+      <span>域名邮箱池 / 激活码 / API Key</span>
+    </div>
+    <div class="top-actions">
+      <span id="topUser">未登录</span>
+      <button class="button ghost small hidden" id="logoutButton" type="button">退出</button>
+    </div>
+  </header>
+
+  <main class="page">
+    <section class="auth-grid" id="authPanel">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">用户入口</div>
+          <div class="tabs">
+            <button class="tab active" id="loginTab" type="button">登录</button>
+            <button class="tab" id="registerTab" type="button">注册</button>
+          </div>
+        </div>
+        <div class="card-body">
+          <form class="form" id="loginForm">
+            <label>账号
+              <input name="username" autocomplete="username" placeholder="buyer001">
+            </label>
+            <label>密码
+              <input name="password" type="password" autocomplete="current-password" placeholder="至少 6 位">
+            </label>
+            <button class="button" type="submit">登录邮箱池</button>
+          </form>
+          <form class="form hidden" id="registerForm">
+            <label>账号
+              <input name="username" autocomplete="username" placeholder="buyer001">
+            </label>
+            <label>密码
+              <input name="password" type="password" autocomplete="new-password" placeholder="至少 6 位">
+            </label>
+            <label>激活码
+              <input name="code" placeholder="SM-XXXX-XXXX-XXXX">
+            </label>
+            <button class="button" type="submit">注册并激活次数</button>
+            <p class="hint">激活码由管理员生成。注册成功后，次数会直接进入这个账号。</p>
+          </form>
+        </div>
+      </div>
+
+      <section class="card" id="adminPanel">
+        <div class="card-header">
+          <div class="card-title">管理员</div>
+          <span class="badge hidden" id="adminBadge">已登录</span>
+        </div>
+        <div class="card-body section-stack">
+          <form class="form" id="adminLoginForm">
+            <div class="grid-2">
+              <label>管理员账号
+                <input name="username" autocomplete="username" placeholder="admin">
+              </label>
+              <label>管理员密码
+                <input name="password" type="password" autocomplete="current-password" placeholder="ADMIN_PASSWORD">
+              </label>
+            </div>
+            <button class="button" type="submit">登录管理员</button>
+            <p class="hint">默认账号是 admin；密码优先用 ADMIN_PASSWORD，没填就用 EMAIL_AUTH。</p>
+          </form>
+
+          <div class="section-stack hidden" id="adminSessionPanel">
+            <div class="grid-2">
+              <div class="sub-card">
+                <p class="sub-title">生成激活码</p>
+                <form class="form" id="adminCodeForm">
+                  <div class="grid-2">
+                    <label>次数
+                      <input name="credits" type="number" min="1" value="50">
+                    </label>
+                    <label>可用人数
+                      <input name="maxUses" type="number" min="1" value="1">
+                    </label>
+                  </div>
+                  <button class="button" type="submit">生成激活码</button>
+                </form>
+              </div>
+              <div class="sub-card">
+                <p class="sub-title">管理员状态</p>
+                <p class="hint" id="adminName">-</p>
+                <button class="button secondary" id="adminLogoutButton" type="button">退出管理员</button>
+              </div>
+            </div>
+            <div class="result-box hidden" id="adminResult"></div>
+          </div>
+        </div>
+      </section>
+    </section>
+
+    <section class="section-stack hidden" id="appPanel">
+      <section class="card">
+        <div class="card-header">
+          <div class="card-title">控制台</div>
+          <span class="hint">创建邮箱会消耗次数；收信不消耗。</span>
+        </div>
+        <div class="card-body section-stack">
+          <div class="stats">
+            <div class="stat">
+              <span>账号</span>
+              <strong id="profileName">-</strong>
+            </div>
+            <div class="stat">
+              <span>剩余次数</span>
+              <strong id="profileCredits">0</strong>
+            </div>
+            <div class="stat">
+              <span>邮箱数量</span>
+              <strong id="profileAddressCount">0</strong>
+            </div>
+            <div class="stat">
+              <span>API Key</span>
+              <strong id="profileApiKeyCount">0</strong>
+            </div>
+          </div>
+
+          <div class="tools-grid">
+            <div class="sub-card">
+              <p class="sub-title">创建邮箱</p>
+              <form class="form" id="singleAddressForm">
+                <div class="grid-2">
+                  <label>自定义前缀
+                    <input name="name" placeholder="001 / 002 / jsbxbx / 留空随机">
+                  </label>
+                  <label>域名
+                    <select name="domain" id="singleDomain"></select>
+                  </label>
+                </div>
+                <button class="button" type="submit">创建 1 个邮箱</button>
+              </form>
+            </div>
+
+            <div class="sub-card">
+              <p class="sub-title">批量创建</p>
+              <form class="form" id="batchAddressForm">
+                <div class="grid-2">
+                  <label>数量
+                    <input name="count" type="number" min="1" value="50">
+                  </label>
+                  <label>域名
+                    <select name="domain" id="batchDomain"></select>
+                  </label>
+                </div>
+                <div class="grid-2">
+                  <label>批量前缀
+                    <input name="prefix" placeholder="nv 留空随机">
+                  </label>
+                  <label>起始编号
+                    <input name="startAt" type="number" min="0" value="1">
+                  </label>
+                </div>
+                <button class="button secondary" type="submit">批量创建</button>
+              </form>
+            </div>
+
+            <div class="sub-card">
+              <p class="sub-title">兑换更多次数</p>
+              <form class="form" id="redeemForm">
+                <label>激活码
+                  <input name="code" placeholder="SM-XXXX-XXXX-XXXX">
+                </label>
+                <button class="button secondary" type="submit">兑换到当前账号</button>
+              </form>
+            </div>
+
+            <div class="sub-card">
+              <p class="sub-title">脚本 API Key</p>
+              <form class="form" id="apiKeyForm">
+                <label>名称
+                  <input name="name" placeholder="nvidia-register">
+                </label>
+                <button class="button secondary" type="submit">生成用户 API Key</button>
+              </form>
+              <div class="result-box hidden" id="apiKeyResult"></div>
+              <div class="section-stack" id="apiKeyList"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-header">
+          <div class="card-title">收件箱</div>
+          <button class="button secondary small" id="refreshButton" type="button">刷新</button>
+        </div>
+        <div class="mail-layout">
+          <aside class="address-pane">
+            <div class="pane-toolbar">
+              <strong>邮箱地址</strong>
+              <span class="hint" id="addressCount">0 个</span>
+            </div>
+            <div class="list" id="addressList">
+              <div class="empty">登录后显示邮箱池。</div>
+            </div>
+          </aside>
+
+          <section class="mail-pane">
+            <div class="mail-list" id="mailList">
+              <div class="empty">选择一个邮箱后查看邮件。</div>
+            </div>
+            <div class="mail-detail">
+              <div class="code-box" id="codeBox">
+                <div>
+                  <span>识别到验证码</span>
+                  <strong id="codeText"></strong>
+                </div>
+                <button class="button secondary small" id="copyCodeButton" type="button">复制</button>
+              </div>
+              <pre id="mailRaw">邮件原文会显示在这里。</pre>
+            </div>
+          </section>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    window.APP_CONFIG = ${appConfig};
+
+    const state = {
+      token: localStorage.getItem("small_mailbox_token") || "",
+      adminToken: localStorage.getItem("small_mailbox_admin_token") || "",
+      user: null,
+      admin: null,
+      domains: window.APP_CONFIG.domains || [],
+      apiKeys: [],
+      addresses: [],
+      selectedAddress: "",
+      mails: [],
+      selectedMail: null,
+      authMode: "login"
+    };
+
+    const nodes = {
+      authPanel: document.getElementById("authPanel"),
+      appPanel: document.getElementById("appPanel"),
+      topUser: document.getElementById("topUser"),
+      logoutButton: document.getElementById("logoutButton"),
+      loginTab: document.getElementById("loginTab"),
+      registerTab: document.getElementById("registerTab"),
+      loginForm: document.getElementById("loginForm"),
+      registerForm: document.getElementById("registerForm"),
+      adminLoginForm: document.getElementById("adminLoginForm"),
+      adminSessionPanel: document.getElementById("adminSessionPanel"),
+      adminCodeForm: document.getElementById("adminCodeForm"),
+      adminLogoutButton: document.getElementById("adminLogoutButton"),
+      adminBadge: document.getElementById("adminBadge"),
+      adminName: document.getElementById("adminName"),
+      adminResult: document.getElementById("adminResult"),
+      profileName: document.getElementById("profileName"),
+      profileCredits: document.getElementById("profileCredits"),
+      profileAddressCount: document.getElementById("profileAddressCount"),
+      profileApiKeyCount: document.getElementById("profileApiKeyCount"),
+      redeemForm: document.getElementById("redeemForm"),
+      apiKeyForm: document.getElementById("apiKeyForm"),
+      apiKeyList: document.getElementById("apiKeyList"),
+      apiKeyResult: document.getElementById("apiKeyResult"),
+      singleAddressForm: document.getElementById("singleAddressForm"),
+      batchAddressForm: document.getElementById("batchAddressForm"),
+      singleDomain: document.getElementById("singleDomain"),
+      batchDomain: document.getElementById("batchDomain"),
+      addressList: document.getElementById("addressList"),
+      addressCount: document.getElementById("addressCount"),
+      mailList: document.getElementById("mailList"),
+      mailRaw: document.getElementById("mailRaw"),
+      codeBox: document.getElementById("codeBox"),
+      codeText: document.getElementById("codeText"),
+      copyCodeButton: document.getElementById("copyCodeButton"),
+      refreshButton: document.getElementById("refreshButton"),
+      toast: document.getElementById("toast")
+    };
+
+    function escapeHtml(value) {
+      return String(value || "").replace(/[&<>"']/g, function (char) {
+        return {
+          "&": "&amp;",
+          "<": "&lt;",
+          ">": "&gt;",
+          '"': "&quot;",
+          "'": "&#039;"
+        }[char];
+      });
+    }
+
+    async function requestJson(path, options) {
+      const requestOptions = options || {};
+      const headers = Object.assign({ "content-type": "application/json" }, requestOptions.headers || {});
+      const response = await fetch(path, Object.assign({}, requestOptions, { headers: headers }));
+      const data = await response.json().catch(function () { return {}; });
+
+      if (!response.ok) {
+        throw new Error(data.error || "request_failed");
+      }
+
+      return data;
+    }
+
+    async function userApi(path, options) {
+      const requestOptions = options || {};
+      const headers = Object.assign({}, requestOptions.headers || {});
+      if (state.token) {
+        headers.authorization = "Bearer " + state.token;
+      }
+      return requestJson(path, Object.assign({}, requestOptions, { headers: headers }));
+    }
+
+    async function adminApi(path, options) {
+      const requestOptions = options || {};
+      const headers = Object.assign({}, requestOptions.headers || {});
+      if (state.adminToken) {
+        headers.authorization = "Bearer " + state.adminToken;
+      }
+      return requestJson(path, Object.assign({}, requestOptions, { headers: headers }));
+    }
+
+    function toast(message) {
+      nodes.toast.textContent = message;
+      nodes.toast.classList.add("visible");
+      setTimeout(function () {
+        nodes.toast.classList.remove("visible");
+      }, 2600);
+    }
+
+    function setBusy(form, busy) {
+      Array.from(form.querySelectorAll("button, input, select")).forEach(function (node) {
+        node.disabled = busy;
+      });
+    }
+
+    function formJson(form) {
+      return Object.fromEntries(new FormData(form).entries());
+    }
+
+    function setAuthMode(mode) {
+      state.authMode = mode;
+      nodes.loginTab.classList.toggle("active", mode === "login");
+      nodes.registerTab.classList.toggle("active", mode === "register");
+      nodes.loginForm.classList.toggle("hidden", mode !== "login");
+      nodes.registerForm.classList.toggle("hidden", mode !== "register");
+    }
+
+    function renderDomains() {
+      const domains = state.domains.length ? state.domains : [window.APP_CONFIG.defaultDomain].filter(Boolean);
+      const options = domains.map(function (domain) {
+        return '<option value="' + escapeHtml(domain) + '">' + escapeHtml(domain) + '</option>';
+      }).join("");
+      nodes.singleDomain.innerHTML = options;
+      nodes.batchDomain.innerHTML = options;
+    }
+
+    function renderUser() {
+      const loggedIn = Boolean(state.user);
+      nodes.authPanel.classList.toggle("hidden", loggedIn);
+      nodes.appPanel.classList.toggle("hidden", !loggedIn);
+      nodes.logoutButton.classList.toggle("hidden", !loggedIn);
+      nodes.topUser.textContent = loggedIn ? state.user.username : "未登录";
+      nodes.profileName.textContent = loggedIn ? state.user.username : "-";
+      nodes.profileCredits.textContent = loggedIn ? state.user.credits : "0";
+      nodes.profileAddressCount.textContent = String(state.addresses.length || 0);
+      nodes.profileApiKeyCount.textContent = String(state.apiKeys.filter(function (key) { return key.active; }).length || 0);
+    }
+
+    function renderAdmin() {
+      const loggedIn = Boolean(state.admin);
+      nodes.adminLoginForm.classList.toggle("hidden", loggedIn);
+      nodes.adminSessionPanel.classList.toggle("hidden", !loggedIn);
+      nodes.adminBadge.classList.toggle("hidden", !loggedIn);
+      nodes.adminName.textContent = loggedIn ? ("当前管理员：" + state.admin.username) : "-";
+    }
+
+    function renderAddresses() {
+      nodes.profileAddressCount.textContent = String(state.addresses.length || 0);
+      nodes.addressCount.textContent = state.addresses.length + " 个";
+
+      if (!state.user) {
+        nodes.addressList.innerHTML = '<div class="empty">登录后显示邮箱池。</div>';
+        return;
+      }
+
+      if (!state.addresses.length) {
+        nodes.addressList.innerHTML = '<div class="empty">还没有邮箱。先用激活码获得次数，再创建邮箱。</div>';
+        return;
+      }
+
+      nodes.addressList.innerHTML = state.addresses.map(function (address) {
+        const active = address.address === state.selectedAddress ? " active" : "";
+        return '<button class="item' + active + '" data-address="' + escapeHtml(address.address) + '" type="button">' +
+          '<strong>' + escapeHtml(address.address) + '</strong>' +
+          '<span>' + Number(address.mail_count || 0) + ' 封邮件 · ' + escapeHtml(address.last_mail_at || "暂无来信") + '</span>' +
+          '</button>';
+      }).join("");
+    }
+
+    function renderApiKeys() {
+      const activeKeys = state.apiKeys.filter(function (key) { return key.active; });
+      nodes.profileApiKeyCount.textContent = String(activeKeys.length || 0);
+
+      if (!state.user) {
+        nodes.apiKeyList.innerHTML = "";
+        nodes.apiKeyResult.classList.add("hidden");
+        return;
+      }
+
+      if (!activeKeys.length) {
+        nodes.apiKeyList.innerHTML = '<div class="empty">还没有 API Key。生成后可填进脚本 EMAIL_AUTH。</div>';
+        return;
+      }
+
+      nodes.apiKeyList.innerHTML = activeKeys.map(function (key) {
+        return '<div class="item">' +
+          '<strong>' + escapeHtml(key.name || "default") + '</strong>' +
+          '<span>' + escapeHtml(key.key_prefix) + '•••• · 最近使用 ' + escapeHtml(key.last_used_at || "从未") + '</span>' +
+          '<div class="item-actions">' +
+          '<span>创建于 ' + escapeHtml(key.created_at || "") + '</span>' +
+          '<button class="button danger small" data-revoke-key="' + escapeHtml(key.id) + '" type="button">吊销</button>' +
+          '</div>' +
+          '</div>';
+      }).join("");
+    }
+
+    function renderMails() {
+      if (!state.selectedAddress) {
+        nodes.mailList.innerHTML = '<div class="empty">选择一个邮箱后查看邮件。</div>';
+        nodes.mailRaw.textContent = "邮件原文会显示在这里。";
+        nodes.codeBox.classList.remove("visible");
+        return;
+      }
+
+      if (!state.mails.length) {
+        nodes.mailList.innerHTML = '<div class="empty">' + escapeHtml(state.selectedAddress) + ' 暂时没有邮件。</div>';
+        nodes.mailRaw.textContent = "等待来信后，点击邮件即可查看 raw 原文。";
+        nodes.codeBox.classList.remove("visible");
+        return;
+      }
+
+      nodes.mailList.innerHTML = state.mails.map(function (mail) {
+        const active = state.selectedMail && state.selectedMail.id === mail.id ? " active" : "";
+        return '<button class="item' + active + '" data-mail-id="' + escapeHtml(mail.id) + '" type="button">' +
+          '<strong>' + escapeHtml(mail.subject || "(无主题)") + '</strong>' +
+          '<span>' + escapeHtml(mail.from || "") + ' · ' + escapeHtml(mail.created_at || "") + '</span>' +
+          '</button>';
+      }).join("");
+    }
+
+    function renderMailDetail(mail) {
+      if (!mail) {
+        nodes.mailRaw.textContent = "邮件原文会显示在这里。";
+        nodes.codeBox.classList.remove("visible");
+        return;
+      }
+
+      nodes.mailRaw.textContent = mail.raw || "";
+      const code = extractVerificationCode(mail.raw || "");
+      nodes.codeText.textContent = code;
+      nodes.codeBox.classList.toggle("visible", Boolean(code));
+    }
+
+    function extractVerificationCode(raw) {
+      const match = raw.match(/\\b\\d{3}[-–]\\d{3}\\b/);
+      return match ? match[0].replace("–", "-") : "";
+    }
+
+    async function loadMe() {
+      const data = await userApi("/app/api/me");
+      state.user = data.user;
+      state.domains = data.domains || state.domains;
+      renderDomains();
+      renderUser();
+      await loadAddresses();
+      await loadApiKeys();
+      renderUser();
+    }
+
+    async function loadAdminMe() {
+      const data = await adminApi("/admin/me");
+      state.admin = data.admin;
+      renderAdmin();
+    }
+
+    async function loadAddresses() {
+      const data = await userApi("/app/api/addresses");
+      state.addresses = data.results || data.data || [];
+      if (!state.selectedAddress && state.addresses.length) {
+        state.selectedAddress = state.addresses[0].address;
+      }
+      if (state.selectedAddress && !state.addresses.some(function (item) { return item.address === state.selectedAddress; })) {
+        state.selectedAddress = state.addresses.length ? state.addresses[0].address : "";
+      }
+      renderAddresses();
+      if (state.selectedAddress) {
+        await loadMails(state.selectedAddress);
+      } else {
+        renderMails();
+      }
+    }
+
+    async function loadApiKeys() {
+      const data = await userApi("/app/api/api_keys");
+      state.apiKeys = data.results || data.data || [];
+      renderApiKeys();
+    }
+
+    async function loadMails(address) {
+      state.selectedAddress = address;
+      const data = await userApi("/app/api/mails?limit=20&offset=0&address=" + encodeURIComponent(address));
+      state.mails = data.results || data.data || [];
+      state.selectedMail = null;
+      renderAddresses();
+      renderMails();
+      renderMailDetail(null);
+    }
+
+    async function openMail(id) {
+      const data = await userApi("/app/api/mail/" + encodeURIComponent(id));
+      state.selectedMail = data;
+      renderMails();
+      renderMailDetail(data);
+    }
+
+    async function copyText(value) {
+      await navigator.clipboard.writeText(value);
+      toast("已复制");
+    }
+
+    async function authSubmit(form, endpoint) {
+      setBusy(form, true);
+      try {
+        const data = await requestJson(endpoint, {
+          method: "POST",
+          body: JSON.stringify(formJson(form))
+        });
+        state.token = data.token;
+        state.user = data.user;
+        localStorage.setItem("small_mailbox_token", state.token);
+        form.reset();
+        renderUser();
+        await loadAddresses();
+        await loadApiKeys();
+        renderUser();
+        toast(data.credits_added ? ("已激活 " + data.credits_added + " 次") : "已登录");
+      } catch (error) {
+        toast(error.message);
+      } finally {
+        setBusy(form, false);
+      }
+    }
+
+    nodes.loginTab.addEventListener("click", function () { setAuthMode("login"); });
+    nodes.registerTab.addEventListener("click", function () { setAuthMode("register"); });
+
+    nodes.loginForm.addEventListener("submit", function (event) {
+      event.preventDefault();
+      authSubmit(nodes.loginForm, "/app/api/login");
+    });
+
+    nodes.registerForm.addEventListener("submit", function (event) {
+      event.preventDefault();
+      authSubmit(nodes.registerForm, "/app/api/register");
+    });
+
+    nodes.logoutButton.addEventListener("click", function () {
+      localStorage.removeItem("small_mailbox_token");
+      state.token = "";
+      state.user = null;
+      state.apiKeys = [];
+      state.addresses = [];
+      state.mails = [];
+      state.selectedAddress = "";
+      state.selectedMail = null;
+      renderUser();
+      renderAddresses();
+      renderApiKeys();
+      renderMails();
+      toast("已退出用户");
+    });
+
+    nodes.adminLoginForm.addEventListener("submit", async function (event) {
+      event.preventDefault();
+      setBusy(nodes.adminLoginForm, true);
+      try {
+        const data = await requestJson("/admin/login", {
+          method: "POST",
+          body: JSON.stringify(formJson(nodes.adminLoginForm))
+        });
+        state.adminToken = data.token;
+        state.admin = data.admin;
+        localStorage.setItem("small_mailbox_admin_token", state.adminToken);
+        nodes.adminLoginForm.reset();
+        renderAdmin();
+        toast("管理员已登录");
+      } catch (error) {
+        toast(error.message);
+      } finally {
+        setBusy(nodes.adminLoginForm, false);
+      }
+    });
+
+    nodes.adminLogoutButton.addEventListener("click", function () {
+      localStorage.removeItem("small_mailbox_admin_token");
+      state.adminToken = "";
+      state.admin = null;
+      nodes.adminResult.classList.add("hidden");
+      nodes.adminResult.textContent = "";
+      renderAdmin();
+      toast("管理员已退出");
+    });
+
+    nodes.adminCodeForm.addEventListener("submit", async function (event) {
+      event.preventDefault();
+      setBusy(nodes.adminCodeForm, true);
+      try {
+        const values = formJson(nodes.adminCodeForm);
+        const data = await adminApi("/admin/redeem_codes", {
+          method: "POST",
+          body: JSON.stringify({
+            credits: Number(values.credits),
+            maxUses: Number(values.maxUses)
+          })
+        });
+        nodes.adminResult.classList.remove("hidden");
+        nodes.adminResult.textContent = "激活码：" + data.code + "\\n次数：" + data.credits + "\\n可用人数：" + data.max_uses;
+        await copyText(data.code);
+      } catch (error) {
+        if (error.message === "unauthorized") {
+          localStorage.removeItem("small_mailbox_admin_token");
+          state.adminToken = "";
+          state.admin = null;
+          renderAdmin();
+        }
+        toast(error.message);
+      } finally {
+        setBusy(nodes.adminCodeForm, false);
+      }
+    });
+
+    nodes.redeemForm.addEventListener("submit", async function (event) {
+      event.preventDefault();
+      setBusy(nodes.redeemForm, true);
+      try {
+        const data = await userApi("/app/api/redeem", {
+          method: "POST",
+          body: JSON.stringify(formJson(nodes.redeemForm))
+        });
+        state.user = data.user;
+        renderUser();
+        nodes.redeemForm.reset();
+        toast("已增加 " + data.credits_added + " 次");
+      } catch (error) {
+        toast(error.message);
+      } finally {
+        setBusy(nodes.redeemForm, false);
+      }
+    });
+
+    nodes.apiKeyForm.addEventListener("submit", async function (event) {
+      event.preventDefault();
+      setBusy(nodes.apiKeyForm, true);
+      try {
+        const data = await userApi("/app/api/api_keys", {
+          method: "POST",
+          body: JSON.stringify(formJson(nodes.apiKeyForm))
+        });
+        const domain = nodes.singleDomain.value || window.APP_CONFIG.defaultDomain || "";
+        const envText = "EMAIL_API=" + location.origin + "\\n" +
+          "EMAIL_AUTH=" + data.api_key + "\\n" +
+          "EMAIL_DOMAIN=" + domain;
+        nodes.apiKeyResult.classList.remove("hidden");
+        nodes.apiKeyResult.textContent = envText;
+        await copyText(data.api_key);
+        await loadApiKeys();
+        nodes.apiKeyForm.reset();
+        renderUser();
+        toast("API Key 已生成");
+      } catch (error) {
+        toast(error.message);
+      } finally {
+        setBusy(nodes.apiKeyForm, false);
+      }
+    });
+
+    nodes.apiKeyList.addEventListener("click", async function (event) {
+      const button = event.target.closest("[data-revoke-key]");
+      if (!button) return;
+      try {
+        await userApi("/app/api/api_keys/revoke", {
+          method: "POST",
+          body: JSON.stringify({ id: Number(button.dataset.revokeKey) })
+        });
+        await loadApiKeys();
+        renderUser();
+        toast("API Key 已吊销");
+      } catch (error) {
+        toast(error.message);
+      }
+    });
+
+    nodes.singleAddressForm.addEventListener("submit", async function (event) {
+      event.preventDefault();
+      setBusy(nodes.singleAddressForm, true);
+      try {
+        const data = await userApi("/app/api/addresses", {
+          method: "POST",
+          body: JSON.stringify(formJson(nodes.singleAddressForm))
+        });
+        state.user = data.user;
+        state.selectedAddress = data.address;
+        await loadAddresses();
+        renderUser();
+        nodes.singleAddressForm.reset();
+        renderDomains();
+        toast("邮箱已创建：" + data.address);
+      } catch (error) {
+        toast(error.message);
+      } finally {
+        setBusy(nodes.singleAddressForm, false);
+      }
+    });
+
+    nodes.batchAddressForm.addEventListener("submit", async function (event) {
+      event.preventDefault();
+      setBusy(nodes.batchAddressForm, true);
+      try {
+        const values = formJson(nodes.batchAddressForm);
+        const data = await userApi("/app/api/addresses/batch", {
+          method: "POST",
+          body: JSON.stringify({
+            count: Number(values.count),
+            domain: values.domain,
+            prefix: values.prefix,
+            startAt: Number(values.startAt)
+          })
+        });
+        state.user = data.user;
+        await loadAddresses();
+        renderUser();
+        toast("批量创建完成：" + data.addresses.length + " 个");
+      } catch (error) {
+        toast(error.message);
+      } finally {
+        setBusy(nodes.batchAddressForm, false);
+      }
+    });
+
+    nodes.refreshButton.addEventListener("click", async function () {
+      try {
+        if (state.selectedAddress) {
+          await loadMails(state.selectedAddress);
+          toast("已刷新");
+        }
+      } catch (error) {
+        toast(error.message);
+      }
+    });
+
+    nodes.addressList.addEventListener("click", async function (event) {
+      const button = event.target.closest("[data-address]");
+      if (!button) return;
+      try {
+        await loadMails(button.dataset.address);
+      } catch (error) {
+        toast(error.message);
+      }
+    });
+
+    nodes.mailList.addEventListener("click", async function (event) {
+      const button = event.target.closest("[data-mail-id]");
+      if (!button) return;
+      try {
+        await openMail(button.dataset.mailId);
+      } catch (error) {
+        toast(error.message);
+      }
+    });
+
+    nodes.copyCodeButton.addEventListener("click", function () {
+      if (nodes.codeText.textContent) {
+        copyText(nodes.codeText.textContent);
+      }
+    });
+
+    renderDomains();
+    renderUser();
+    renderAdmin();
+    renderAddresses();
+    renderApiKeys();
+    renderMails();
+
+    if (state.token) {
+      loadMe().catch(function () {
+        localStorage.removeItem("small_mailbox_token");
+        state.token = "";
+        state.user = null;
+        renderUser();
+        toast("用户登录已过期");
+      });
+    }
+
+    if (state.adminToken) {
+      loadAdminMe().catch(function () {
+        localStorage.removeItem("small_mailbox_admin_token");
+        state.adminToken = "";
+        state.admin = null;
+        renderAdmin();
       });
     }
   </script>

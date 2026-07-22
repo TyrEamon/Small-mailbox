@@ -1,12 +1,12 @@
 # Small Mailbox
 
-Cloudflare Workers 上的轻量域名邮箱面板，保留 `nvidia-register` 需要的 3 个兼容接口，同时新增网页前端、账号密码、兑换码和批量创建邮箱。
+Cloudflare Workers 上的轻量域名邮箱面板，保留 `nvidia-register` 需要的 3 个兼容接口，同时新增网页前端、账号密码、激活码和批量创建邮箱。
 
 ## 已支持
 
-- 网页面板：访问 Worker 根路径 `/` 即可登录、注册、兑换次数、创建邮箱、查看邮件。
+- 网页面板：访问 Worker 根路径 `/` 即可登录、注册、激活次数、创建邮箱、查看邮件。
 - 无限前缀：只要域名配置了 Email Routing catch-all，`001@域名`、`002@域名`、`jsbxbx@域名` 都能收。
-- 次数售卖：管理员生成 50/100 次兑换码，用户注册后兑换；每创建 1 个邮箱消耗 1 次。
+- 次数售卖：管理员生成 50/100 次激活码，用户注册时填激活码，账号创建后直接得到次数；每创建 1 个邮箱消耗 1 次。
 - 批量创建：随机批量生成，或用 `nv + 001/002/003` 这类编号批量创建。
 - 用户 API Key：买家可以生成自己的 `EMAIL_AUTH`，直接给脚本调用，不需要你的管理员密钥。
 - 邮件存储：D1 保存索引；R2 保存完整 raw 邮件，KV 可作为 fallback。
@@ -33,7 +33,7 @@ Cloudflare Workers 上的轻量域名邮箱面板，保留 `nvidia-register` 需
 | 注册 | `POST` | `/app/api/register` |
 | 登录 | `POST` | `/app/api/login` |
 | 当前用户 | `GET` | `/app/api/me` |
-| 兑换次数 | `POST` | `/app/api/redeem` |
+| 兑换/激活更多次数 | `POST` | `/app/api/redeem` |
 | 地址列表 | `GET` | `/app/api/addresses` |
 | API Key 列表 | `GET` | `/app/api/api_keys` |
 | 创建 API Key | `POST` | `/app/api/api_keys` |
@@ -42,7 +42,9 @@ Cloudflare Workers 上的轻量域名邮箱面板，保留 `nvidia-register` 需
 | 批量创建地址 | `POST` | `/app/api/addresses/batch` |
 | 用户邮件列表 | `GET` | `/app/api/mails?address=xxx@domain` |
 | 用户邮件详情 | `GET` | `/app/api/mail/{id}` |
-| 管理员生成兑换码 | `POST` | `/admin/redeem_codes` |
+| 管理员登录 | `POST` | `/admin/login` |
+| 当前管理员 | `GET` | `/admin/me` |
+| 管理员生成激活码 | `POST` | `/admin/redeem_codes` |
 
 `/app/api/*` 的用户接口可以用两种 Bearer：
 
@@ -78,11 +80,14 @@ GitHub 连接部署时，本仓库不在 `wrangler.jsonc` 写死资源 ID。你�
 
 | 变量名 | 示例值 | 说明 |
 | --- | --- | --- |
-| `EMAIL_AUTH` | `change-me-admin-secret` | 管理员密钥，用来创建地址和生成兑换码 |
+| `EMAIL_AUTH` | `change-me-admin-secret` | 兼容旧脚本的管理员密钥，也作为默认 JWT fallback |
 | `JWT_SECRET` | `change-me-jwt-secret` | JWT 签名密钥；不填时会 fallback 到 `EMAIL_AUTH` |
+| `ADMIN_USERNAME` | `admin` | 管理员网页登录账号；不填默认 `admin` |
+| `ADMIN_PASSWORD` | `change-me-admin-password` | 管理员网页登录密码；不填会 fallback 到 `EMAIL_AUTH` |
 | `EMAIL_DOMAIN` | `tyrlink.dpdns.org` | 默认收信域名 |
 | `EMAIL_DOMAINS` | `tyrlink.dpdns.org,example.com` | 多域名可选，逗号分隔 |
 | `ALLOW_REGISTRATION` | `true` | 是否允许公开注册；想只给邀请用户就设 `false` |
+| `REQUIRE_REGISTER_CODE` | `true` | 注册时是否必须填写激活码；不填默认 `true` |
 | `MAX_BATCH_CREATE` | `100` | 单次批量创建上限 |
 | `RETENTION_HOURS` | `0` | 邮件保留小时数；`0` 表示不自动清理 |
 | `MAX_RAW_BYTES` | `2097152` | 单封 raw 邮件最大字节数，默认 2MB |
@@ -94,9 +99,9 @@ Worker 首次 API 请求会自动建表和迁移 `addresses.user_id`。如果你
 ## 给别人使用的流程
 
 1. 你在网页后台绑定 D1、R2、变量并部署。
-2. 你打开 Worker 根路径 `/`，在“管理员发码”里输入 `EMAIL_AUTH`。
-3. 生成一个 50 次或 100 次兑换码。
-4. 买家自己注册账号、兑换次数。
+2. 你打开 Worker 根路径 `/`，用 `ADMIN_USERNAME` / `ADMIN_PASSWORD` 登录管理员。
+3. 生成一个 50 次或 100 次激活码。
+4. 买家注册账号时填写激活码，注册成功后直接得到次数。
 5. 买家在“脚本 API 密钥”里生成自己的用户 API Key。
 6. 买家可以在网页里批量创建邮箱，也可以把 API Key 填进脚本 `.env` 自动创建。
 7. 买家在网页或 API 里查看这些邮箱收到的邮件和验证码。
