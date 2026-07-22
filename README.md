@@ -7,7 +7,7 @@ Cloudflare Workers 上的轻量域名邮箱面板，保留 `nvidia-register` 需
 - 网页面板：访问 Worker 根路径 `/` 即可统一登录；管理员账号进入后台，用户账号进入邮箱面板。
 - 无限前缀：只要域名配置了 Email Routing catch-all，`001@域名`、`002@域名`、`jsbxbx@域名` 都能收。
 - 次数售卖：管理员生成 50/100 次激活码，用户注册时填激活码，账号创建后直接得到次数；每创建 1 个邮箱消耗 1 次。
-- 批量创建：随机批量生成，或用 `nv + 001/002/003` 这类编号批量创建。
+- 批量创建：随机批量生成，或用 `nv + 001/002/003` 这类编号批量创建；被占用的邮箱名会跳过且不扣次数。
 - 用户 API Key：买家可以生成自己的 `EMAIL_AUTH`，直接给脚本调用，不需要你的管理员密钥。
 - 邮件存储：D1 保存索引；R2 保存完整 raw 邮件，KV 可作为 fallback。
 
@@ -27,6 +27,8 @@ Cloudflare Workers 上的轻量域名邮箱面板，保留 `nvidia-register` 需
 - 用户 API Key：用户在网页里生成，创建地址会扣该用户 1 次额度，并自动归属到他的邮箱池。
 
 管理员密钥还可以作为 `Authorization: Bearer {EMAIL_AUTH}` 使用；访问 `/api/mails` 不带 `address` 时返回全局全部邮箱邮件，带 `address=xxx@domain` 时按邮箱筛选。
+
+批量创建接口返回 `addresses`、`skipped`、`created_count`、`skipped_count`。`skipped[].reason` 为 `occupied` 时表示邮箱名已被其他账号占用，系统会跳过且不扣次数。
 
 ## 网页接口
 

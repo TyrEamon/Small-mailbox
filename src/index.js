@@ -601,7 +601,7 @@ async function handleCreateAppAddressBatch(request, env) {
   const domain = normalizeDomain(body.domain || getDefaultDomain(env));
   const prefix = String(body.prefix || "").trim().toLowerCase();
   const startAt = clampInt(body.start_at || body.startAt, 1, 0, 999999);
-  const addresses = await createOwnedAddressBatch(env, user.id, {
+  const batch = await createOwnedAddressBatch(env, user.id, {
     count,
     domain,
     prefix,
@@ -610,7 +610,11 @@ async function handleCreateAppAddressBatch(request, env) {
   const updatedUser = await getUserById(env, user.id);
 
   return json({
-    addresses,
+    addresses: batch.addresses,
+    skipped: batch.skipped,
+    created_count: batch.addresses.length,
+    skipped_count: batch.skipped.length,
+    requested_count: count,
     user: publicUser(updatedUser),
   }, 201);
 }
@@ -657,8 +661,7 @@ async function handleAppMailDetail(request, env, id) {
   }
 
   return json({
-    ...mailListRow(mail),
-    raw,
+    ...mailDetailPayload(mail, raw),
   });
 }
 
@@ -696,7 +699,7 @@ async function handleMailDetail(request, env, id) {
   }
 
   const mail = await env.MAIL_DB.prepare(
-    `SELECT id, raw_key
+    `SELECT id, address, sender, recipient, subject, raw_key, raw_size, message_id, created_at
      FROM mails
      WHERE id = ? AND address = ?
      LIMIT 1`
@@ -711,11 +714,7 @@ async function handleMailDetail(request, env, id) {
     return errorJson("mail_raw_not_found", 404);
   }
 
-  return json({
-    id: mail.id,
-    _id: mail.id,
-    raw,
-  });
+  return json(mailDetailPayload(mail, raw));
 }
 
 async function listUserMails(env, userId, limit, offset) {
@@ -776,8 +775,7 @@ async function getMailDetailById(env, id) {
   }
 
   return json({
-    ...mailListRow(mail),
-    raw,
+    ...mailDetailPayload(mail, raw),
   });
 }
 
@@ -817,37 +815,58 @@ async function createOwnedAddressBatch(env, userId, options) {
     return createSequentialOwnedAddressBatch(env, userId, options);
   }
 
-  await debitCredits(env, userId, options.count);
-
   const addresses = [];
+  const skipped = [];
   let attempts = 0;
   const maxAttempts = options.count * 20;
 
   while (addresses.length < options.count && attempts < maxAttempts) {
     attempts += 1;
+    const name = createAddressName();
+    const address = `${name}@${options.domain}`;
+    const existing = await getAddressOwner(env, address);
+    if (existing && hasOwner(existing.user_id)) {
+      continue;
+    }
+
+    let debited = false;
     try {
-      const created = await claimAddressForUser(env, userId, createAddressName(), options.domain);
+      await debitCredits(env, userId, 1);
+      debited = true;
+      const created = await claimAddressForUser(env, userId, name, options.domain);
       addresses.push(created);
     } catch (error) {
-      if (error.message !== "address_exists") {
-        const missing = options.count - addresses.length;
-        if (missing > 0) {
-          await addCredits(env, userId, missing);
+      if (error.message === "address_exists") {
+        if (debited) {
+          await addCredits(env, userId, 1);
         }
-        throw error;
+        continue;
       }
+
+      if (error.message === "insufficient_credits") {
+        const missing = options.count - addresses.length;
+        skipped.push(...Array.from({ length: missing }, () => ({
+          address: "",
+          reason: "insufficient_credits",
+        })));
+        break;
+      }
+
+      if (debited) {
+        await addCredits(env, userId, 1);
+      }
+      throw error;
     }
   }
 
-  if (addresses.length < options.count) {
-    const missing = options.count - addresses.length;
-    await addCredits(env, userId, missing);
-    if (addresses.length === 0) {
-      throw httpError("unable_to_create_addresses", 500);
-    }
+  if (addresses.length === 0 && skipped.length === 0) {
+    throw httpError("unable_to_create_addresses", 500);
   }
 
-  return addresses;
+  return {
+    addresses,
+    skipped,
+  };
 }
 
 async function createSequentialOwnedAddressBatch(env, userId, options) {
@@ -864,23 +883,55 @@ async function createSequentialOwnedAddressBatch(env, userId, options) {
     throw httpError("duplicate_address_names", 400);
   }
 
-  await assertAddressesAvailable(env, names.map((name) => `${name}@${options.domain}`));
-  await debitCredits(env, userId, options.count);
-
   const addresses = [];
-  try {
-    for (const name of names) {
+  const skipped = [];
+
+  for (const name of names) {
+    const address = `${name}@${options.domain}`;
+    const existing = await getAddressOwner(env, address);
+    if (existing && hasOwner(existing.user_id)) {
+      skipped.push({
+        address,
+        reason: "occupied",
+      });
+      continue;
+    }
+
+    let debited = false;
+    try {
+      await debitCredits(env, userId, 1);
+      debited = true;
       addresses.push(await claimAddressForUser(env, userId, name, options.domain));
+    } catch (error) {
+      if (error.message !== "address_exists") {
+        if (error.message === "insufficient_credits") {
+          skipped.push(...names.slice(names.indexOf(name)).map((remainingName) => ({
+            address: `${remainingName}@${options.domain}`,
+            reason: "insufficient_credits",
+          })));
+          break;
+        }
+
+        if (debited) {
+          await addCredits(env, userId, 1);
+        }
+        throw error;
+      }
+
+      if (debited) {
+        await addCredits(env, userId, 1);
+      }
+      skipped.push({
+        address,
+        reason: "occupied",
+      });
     }
-  } catch (error) {
-    const missing = options.count - addresses.length;
-    if (missing > 0) {
-      await addCredits(env, userId, missing);
-    }
-    throw error;
   }
 
-  return addresses;
+  return {
+    addresses,
+    skipped,
+  };
 }
 
 async function claimAddressForUser(env, userId, name, domain) {
@@ -1509,6 +1560,16 @@ function mailListRow(mail) {
   };
 }
 
+function mailDetailPayload(mail, raw) {
+  const body = extractMailBody(raw);
+  return {
+    ...mailListRow(mail),
+    raw,
+    html: body.html,
+    text: body.text,
+  };
+}
+
 function apiKeyRow(row) {
   return {
     id: row.id,
@@ -1737,6 +1798,110 @@ function getRawHeader(rawText, headerName) {
   }
 
   return headers.get(headerName.toLowerCase()) || "";
+}
+
+function extractMailBody(rawText) {
+  const parts = collectMimeBodies(rawText);
+  return {
+    html: parts.html[0] || "",
+    text: parts.text[0] || "",
+  };
+}
+
+function collectMimeBodies(rawText) {
+  const rawContentType = getRawHeader(rawText, "content-type");
+  const contentType = rawContentType.toLowerCase();
+  const transferEncoding = getRawHeader(rawText, "content-transfer-encoding").toLowerCase();
+  const body = getRawBody(rawText);
+
+  if (contentType.startsWith("multipart/")) {
+    const boundary = getContentTypeParam(rawContentType, "boundary");
+    if (!boundary) {
+      return { html: [], text: [] };
+    }
+
+    return splitMultipartBody(body, boundary).reduce((result, part) => {
+      const child = collectMimeBodies(part);
+      result.html.push(...child.html);
+      result.text.push(...child.text);
+      return result;
+    }, { html: [], text: [] });
+  }
+
+  const decoded = decodeMimeBody(body, transferEncoding);
+  if (contentType.includes("text/html")) {
+    return { html: [decoded], text: [] };
+  }
+
+  if (contentType.includes("text/plain")) {
+    return { html: [], text: [decoded] };
+  }
+
+  return { html: [], text: [] };
+}
+
+function getRawBody(rawText) {
+  const match = rawText.match(/\r?\n\r?\n/);
+  return match ? rawText.slice(match.index + match[0].length) : "";
+}
+
+function getContentTypeParam(contentType, name) {
+  const pattern = new RegExp(`${name}=("[^"]+"|[^;]+)`, "i");
+  const match = contentType.match(pattern);
+  return match ? match[1].trim().replace(/^"|"$/g, "") : "";
+}
+
+function splitMultipartBody(body, boundary) {
+  const marker = `--${boundary}`;
+  return body
+    .split(marker)
+    .slice(1)
+    .map((part) => part.replace(/^\r?\n/, "").replace(/\r?\n$/, ""))
+    .filter((part) => part && part.trim() !== "--" && !part.startsWith("--"));
+}
+
+function decodeMimeBody(body, encoding) {
+  const normalizedEncoding = String(encoding || "").trim().toLowerCase();
+
+  if (normalizedEncoding === "base64") {
+    return decodeBase64Text(body);
+  }
+
+  if (normalizedEncoding === "quoted-printable") {
+    return decodeQuotedPrintable(body);
+  }
+
+  return body;
+}
+
+function decodeBase64Text(value) {
+  try {
+    const binary = atob(String(value || "").replace(/\s+/g, ""));
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index);
+    }
+    return new TextDecoder().decode(bytes);
+  } catch {
+    return value;
+  }
+}
+
+function decodeQuotedPrintable(value) {
+  const text = String(value || "").replace(/=\r?\n/g, "");
+  const bytes = [];
+
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] === "=" && /^[0-9a-f]{2}$/i.test(text.slice(index + 1, index + 3))) {
+      bytes.push(Number.parseInt(text.slice(index + 1, index + 3), 16));
+      index += 2;
+      continue;
+    }
+
+    bytes.push(text.charCodeAt(index));
+  }
+
+  return new TextDecoder().decode(new Uint8Array(bytes));
 }
 
 function getMaxRawBytes(env) {
@@ -3616,6 +3781,34 @@ function getAppHtml(env) {
       line-height: 1.7;
     }
 
+    .mail-preview {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      overflow: hidden;
+      background: #f4f6f9;
+      margin-bottom: 12px;
+    }
+
+    .mail-preview iframe {
+      display: block;
+      width: 100%;
+      height: 560px;
+      border: 0;
+      background: #fff;
+    }
+
+    .raw-details {
+      margin-top: 12px;
+    }
+
+    .raw-details summary {
+      cursor: pointer;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      margin-bottom: 10px;
+    }
+
     .result-box {
       display: block;
       max-height: 160px;
@@ -3850,8 +4043,14 @@ function getAppHtml(env) {
                   </div>
                   <button class="button secondary small" id="adminCopyCodeButton" type="button">复制</button>
                 </div>
-                <div class="detail-title">邮件原文 Raw</div>
-                <pre id="adminMailRaw">邮件原文会显示在这里。</pre>
+                <div class="detail-title">邮件预览</div>
+                <div class="mail-preview hidden" id="adminMailPreviewWrap">
+                  <iframe id="adminMailPreview" sandbox="" referrerpolicy="no-referrer"></iframe>
+                </div>
+                <details class="raw-details">
+                  <summary>Raw 原文</summary>
+                  <pre id="adminMailRaw">邮件原文会显示在这里。</pre>
+                </details>
               </div>
             </section>
           </div>
@@ -3921,6 +4120,7 @@ function getAppHtml(env) {
                 </div>
                 <button class="button secondary" type="submit">批量创建</button>
               </form>
+              <div class="result-box hidden" id="batchResult"></div>
             </div>
 
             <div class="sub-card">
@@ -3976,8 +4176,14 @@ function getAppHtml(env) {
                 </div>
                 <button class="button secondary small" id="copyCodeButton" type="button">复制</button>
               </div>
-              <div class="detail-title">邮件原文 Raw</div>
-              <pre id="mailRaw">邮件原文会显示在这里。</pre>
+              <div class="detail-title">邮件预览</div>
+              <div class="mail-preview hidden" id="mailPreviewWrap">
+                <iframe id="mailPreview" sandbox="" referrerpolicy="no-referrer"></iframe>
+              </div>
+              <details class="raw-details">
+                <summary>Raw 原文</summary>
+                <pre id="mailRaw">邮件原文会显示在这里。</pre>
+              </details>
             </div>
           </section>
         </div>
@@ -4026,6 +4232,8 @@ function getAppHtml(env) {
       adminRefreshButton: document.getElementById("adminRefreshButton"),
       adminAddressList: document.getElementById("adminAddressList"),
       adminMailList: document.getElementById("adminMailList"),
+      adminMailPreviewWrap: document.getElementById("adminMailPreviewWrap"),
+      adminMailPreview: document.getElementById("adminMailPreview"),
       adminMailRaw: document.getElementById("adminMailRaw"),
       adminCodeBox: document.getElementById("adminCodeBox"),
       adminCodeText: document.getElementById("adminCodeText"),
@@ -4041,11 +4249,14 @@ function getAppHtml(env) {
       apiKeyResult: document.getElementById("apiKeyResult"),
       singleAddressForm: document.getElementById("singleAddressForm"),
       batchAddressForm: document.getElementById("batchAddressForm"),
+      batchResult: document.getElementById("batchResult"),
       singleDomain: document.getElementById("singleDomain"),
       batchDomain: document.getElementById("batchDomain"),
       addressList: document.getElementById("addressList"),
       addressCount: document.getElementById("addressCount"),
       mailList: document.getElementById("mailList"),
+      mailPreviewWrap: document.getElementById("mailPreviewWrap"),
+      mailPreview: document.getElementById("mailPreview"),
       mailRaw: document.getElementById("mailRaw"),
       codeBox: document.getElementById("codeBox"),
       codeText: document.getElementById("codeText"),
@@ -4306,9 +4517,11 @@ function getAppHtml(env) {
       if (!mail) {
         nodes.adminMailRaw.textContent = "邮件原文会显示在这里。";
         nodes.adminCodeBox.classList.remove("visible");
+        clearMailPreview(nodes.adminMailPreviewWrap, nodes.adminMailPreview);
         return;
       }
 
+      renderMailPreview(nodes.adminMailPreviewWrap, nodes.adminMailPreview, mail);
       nodes.adminMailRaw.textContent = mail.raw || "";
       const code = extractVerificationCode(mail.raw || "");
       nodes.adminCodeText.textContent = code;
@@ -4319,9 +4532,11 @@ function getAppHtml(env) {
       if (!mail) {
         nodes.mailRaw.textContent = "邮件原文会显示在这里。";
         nodes.codeBox.classList.remove("visible");
+        clearMailPreview(nodes.mailPreviewWrap, nodes.mailPreview);
         return;
       }
 
+      renderMailPreview(nodes.mailPreviewWrap, nodes.mailPreview, mail);
       nodes.mailRaw.textContent = mail.raw || "";
       const code = extractVerificationCode(mail.raw || "");
       nodes.codeText.textContent = code;
@@ -4331,6 +4546,69 @@ function getAppHtml(env) {
     function extractVerificationCode(raw) {
       const match = raw.match(/\\b\\d{3}[-–]\\d{3}\\b/);
       return match ? match[0].replace("–", "-") : "";
+    }
+
+    function clearMailPreview(wrapper, frame) {
+      frame.srcdoc = "";
+      wrapper.classList.add("hidden");
+    }
+
+    function renderMailPreview(wrapper, frame, mail) {
+      if (!mail) {
+        clearMailPreview(wrapper, frame);
+        return;
+      }
+
+      if (mail.html) {
+        frame.srcdoc = mail.html;
+        wrapper.classList.remove("hidden");
+        return;
+      }
+
+      if (mail.text) {
+        frame.srcdoc = '<!doctype html><meta charset="utf-8"><style>body{margin:0;padding:24px;background:#fff;color:#111827;font:15px/1.7 sans-serif}pre{white-space:pre-wrap;word-break:break-word;font:inherit}</style><pre>' + escapeHtml(mail.text) + '</pre>';
+        wrapper.classList.remove("hidden");
+        return;
+      }
+
+      clearMailPreview(wrapper, frame);
+    }
+
+    function skippedReasonText(reason) {
+      if (reason === "occupied") return "已被占用";
+      if (reason === "insufficient_credits") return "次数不足";
+      return reason || "已跳过";
+    }
+
+    function renderBatchResult(data) {
+      const addresses = data.addresses || [];
+      const skipped = data.skipped || [];
+      const occupied = skipped.filter(function (item) { return item.reason === "occupied"; });
+      const insufficient = skipped.filter(function (item) { return item.reason === "insufficient_credits"; });
+      const lines = [
+        "批量创建结果",
+        "成功创建：" + addresses.length + " 个",
+        "跳过：" + skipped.length + " 个"
+      ];
+
+      if (occupied.length) {
+        lines.push("");
+        lines.push("已跳过被占用的邮箱名：");
+        occupied.slice(0, 30).forEach(function (item) {
+          lines.push("- " + item.address);
+        });
+        if (occupied.length > 30) {
+          lines.push("... 还有 " + (occupied.length - 30) + " 个");
+        }
+      }
+
+      if (insufficient.length) {
+        lines.push("");
+        lines.push("次数不足，剩余未创建：" + insufficient.length + " 个");
+      }
+
+      nodes.batchResult.classList.remove("hidden");
+      nodes.batchResult.textContent = lines.join("\\n");
     }
 
     async function loadMe() {
@@ -4678,7 +4956,18 @@ function getAppHtml(env) {
         state.user = data.user;
         await loadAddresses();
         renderUser();
-        toast("批量创建完成：" + data.addresses.length + " 个");
+        renderBatchResult(data);
+        const skipped = data.skipped || [];
+        const occupiedCount = skipped.filter(function (item) { return item.reason === "occupied"; }).length;
+        const insufficientCount = skipped.filter(function (item) { return item.reason === "insufficient_credits"; }).length;
+        let message = "批量创建完成：成功 " + (data.addresses || []).length + " 个";
+        if (occupiedCount) {
+          message += "，已跳过被占用 " + occupiedCount + " 个";
+        }
+        if (insufficientCount) {
+          message += "，次数不足 " + insufficientCount + " 个";
+        }
+        toast(message);
       } catch (error) {
         toast(error.message);
       } finally {
